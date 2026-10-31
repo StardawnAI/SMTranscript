@@ -283,8 +283,8 @@ docker run -d -p 127.0.0.1:47821:8765 -e SMT_API_KEYS=me:<a long random key> \
 
 | Route                                                                          |                                                                         |
 | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
-| `POST /v1/jobs` `{url, language?, route?, asr?, asr_model?, idempotency_key?}` | a video → `202 {job_id}` (the same request again: the same job)         |
-| `POST /v1/profile-imports` `{url, max_items, since?, until?, …}`               | an account → `202 {job_id}`                                             |
+| `POST /v1/jobs` `{url, language?, route?, asr?, asr_model?, idempotency_key?}` | a video → `202 {job_id}` (the same request again: the same job); with `"kind": "images"` the text on an Instagram picture post |
+| `POST /v1/profile-imports` `{url, max_items, since?, until?, include_images?, …}`               | an account → `202 {job_id}`; its result lists every post with its `kind` and job |
 | `GET /v1/jobs/{id}`                                                            | status, error class, `retry_after_s`                                    |
 | `GET /v1/jobs/{id}/result`                                                     | the result (`schema_version` 1.0), or `202` while it is not done        |
 | `POST /v1/jobs/{id}/cancel`                                                    | stop it; what is stored stays                                           |
