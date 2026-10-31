@@ -127,6 +127,7 @@ class Engine:
                 "update job set status = 'queued', stage = ?, attempts = 0, next_at = 0, error_class = null,"
                 " error = null, warnings = '[]', finished_at = null, updated_at = ? where id = ?",
                 ("profile" if kind == "profile" else "fetch", _now(), existing["id"]))
+            self.db.run("delete from profile_cursor where job_id = ?", (existing["id"],))
             self.db.audit("retry", tenant, existing["id"])
             existing = self.db.one("select * from job where id = ?", (existing["id"],))
         if existing:
@@ -652,6 +653,25 @@ class Engine:
                 " do update set cursor = coalesce(excluded.cursor, cursor), seen = excluded.seen",
                 (job["id"], json.dumps(cur) if cur else None, json.dumps(items)))
 
+        seen = {i["id"] for i in items}
+        child_opts = {"language": opts["language"], "route": opts["route"], "asr_model": opts["asr_model"],
+                      "asr": opts["asr"]}
+
+        def take(item, cur=None):
+            """One listed post: its own job, and kept with the cursor right away."""
+            taken = item.get("taken_at")
+            if len(items) >= opts["max_items"] or item["id"] in seen:
+                return
+            if taken and ((since and taken < since) or (until and taken >= until)):
+                return
+            kind = item.get("kind") or "reel"
+            submit = self.submit_images if kind in ("image", "carousel") else self.submit_video
+            child, _ = submit(job["tenant"], item["url"], child_opts, parent=job["id"])
+            items.append({"id": item["id"], "url": item["url"], "job_id": child["id"], "kind": kind,
+                          "caption": item.get("caption"), "taken_at": taken.isoformat() if taken else None})
+            seen.add(item["id"])
+            save(cur)
+
         self._set(job["id"], status="resolving")
         cookie_dir = self.s.tmp_dir / job["id"]
         cookie_dir.mkdir(parents=True, exist_ok=True)
@@ -666,7 +686,7 @@ class Engine:
                     else:
                         found = self.fetch.instagram_profile(
                             target.platform_id, opts["max_items"], since, proxy, count, cursor,
-                            self.s.instaloader_session, self.s.instagram_user, on_cursor=save,
+                            self.s.instaloader_session, self.s.instagram_user, on_item=take,
                             include_images=opts.get("include_images", False))
                     self.routes.record(target.platform, job["route"], None)
                 except JobError as err:
@@ -675,24 +695,8 @@ class Engine:
         finally:
             shutil.rmtree(cookie_dir, ignore_errors=True)
 
-        seen = {i["id"] for i in items}
-        for item in found:
-            if len(items) >= opts["max_items"]:
-                break
-            taken = item.get("taken_at")
-            if taken and ((since and taken < since) or (until and taken >= until)):
-                continue
-            if item["id"] in seen:
-                continue
-            kind = item.get("kind") or "reel"
-            child_opts = {"language": opts["language"], "route": opts["route"], "asr_model": opts["asr_model"],
-                          "asr": opts["asr"]}
-            submit = self.submit_images if kind in ("image", "carousel") else self.submit_video
-            child, _ = submit(job["tenant"], item["url"], child_opts, parent=job["id"])
-            items.append({"id": item["id"], "url": item["url"], "job_id": child["id"], "kind": kind,
-                          "caption": item.get("caption"), "taken_at": taken.isoformat() if taken else None})
-            seen.add(item["id"])
-            save()
+        for item in found:  # already taken one by one where the listing streams them
+            take(item)
         save()
         if len(items) < opts["max_items"]:
             self._warn(job["id"], f"found {len(items)} of {opts['max_items']} videos asked for "

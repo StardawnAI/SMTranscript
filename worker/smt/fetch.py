@@ -195,6 +195,12 @@ def _instaloader(proxy: str | None, count, session: Path | None, user: str | Non
     from instaloader.instaloadercontext import RateController
 
     class Refuse(RateController):
+        # Every query Instagram is asked passes here, whichever session sends
+        # it, so this is where they are counted.
+        def wait_before_query(self, query_type):
+            count()
+            return super().wait_before_query(query_type)
+
         # Instaloader's own answer to a 429 is to sleep, for many minutes,
         # inside the call. The wait belongs to the route budget instead.
         def handle_429(self, query_type):
@@ -209,7 +215,6 @@ def _instaloader(proxy: str | None, count, session: Path | None, user: str | Non
     if proxy:
         sess.proxies = {"http": proxy, "https": proxy}
     sess.trust_env = False
-    sess.hooks["response"].append(lambda *_a, **_k: count())
     if session and user and session.is_file():
         loader.load_session_from_file(user, str(session))
     return loader
@@ -221,12 +226,76 @@ def _post_kind(post) -> str:
     return "carousel" if post.typename == "GraphSidecar" else "image"
 
 
+def _describe_post(post) -> dict:
+    return {"id": post.shortcode, "url": f"https://www.instagram.com/p/{post.shortcode}/", "kind": _post_kind(post),
+            "caption": (post.caption or "")[:2000], "taken_at": post.date_utc.replace(tzinfo=dt.timezone.utc)}
+
+
+# Instagram media ids carry their time: milliseconds since this epoch, above bit 23.
+_IG_EPOCH_MS = 1314220021721
+
+
+def _describe_node(node: dict) -> dict:
+    """A post from a node of the logged-out profile timeline, without asking
+    Instagram for anything more."""
+    media_type = node.get("media_type")
+    if media_type == 2 or node.get("product_type") == "clips":
+        kind = "reel"
+    elif media_type == 8 or node.get("product_type") == "carousel_container":
+        kind = "carousel"
+    else:
+        kind = "image"
+    caption = node.get("caption")
+    text = caption.get("text") if isinstance(caption, dict) else caption
+    try:
+        taken = dt.datetime.fromtimestamp(((int(node.get("pk") or node["id"].split("_")[0]) >> 23) + _IG_EPOCH_MS) / 1000,
+                                          dt.timezone.utc)
+    except (KeyError, ValueError, TypeError):
+        taken = None
+    return {"id": node["code"], "url": f"https://www.instagram.com/p/{node['code']}/", "kind": kind,
+            "caption": (text or "")[:2000], "taken_at": taken}
+
+
+def _logged_out_timeline(context, account: str):
+    """The account's timeline as the logged-out web app pages through it, its
+    nodes kept as they come.
+
+    Instaloader 4.16 turns every node into a full Post with one more query per
+    post ("the nodes lack most of the post's metadata"), and after 200 of them
+    in 11 minutes its rate limiter sleeps: listing immo.dommi stopped at post
+    199 (measured 2026-10-31). What the nodes do have — code, media type,
+    caption, and the time inside the id — is all a listing needs, so an
+    account of 366 posts costs about 31 queries instead of 397.
+    """
+    from instaloader.nodeiterator import NodeIterator
+
+    page = context.get_page_data(f"{account}/")
+    if any((d.get("xig_user_by_username") or {}).get("is_private") for d in page):
+        raise JobError("private", f"the account {account} is private")
+    user = next((d["xig_user_by_username"] for d in page
+                 if "polaris_ordered_timeline_connection" in (d.get("xig_user_by_username") or {})), None)
+    if user is None:
+        raise JobError("unavailable", f"no posts on the profile page of {account}")
+    return NodeIterator(
+        context=context,
+        edge_extractor=lambda d: d["data"]["node"]["polaris_ordered_timeline_connection"],
+        node_wrapper=lambda n: n,
+        query_variables={"id": user["id"], "__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider": False},
+        query_referer=f"https://www.instagram.com/{account}/",
+        doc_id="28904005159232689",
+        query_hash=None,
+        first_data=user["polaris_ordered_timeline_connection"],
+        web_api=True,
+    )
+
+
 def instagram_profile(account: str, limit: int, since: dt.datetime | None, proxy: str | None, count,
                       cursor: dict | None = None, session: Path | None = None, user: str | None = None,
-                      on_cursor=lambda c: None, include_images: bool = False) -> list[dict]:
+                      on_item=lambda item, cursor: None, include_images: bool = False) -> list[dict]:
     """Up to `limit` posts of an account, newest first: its reels, and with
     `include_images` its picture posts and carousels too, each with its kind
-    and caption.
+    and caption. `on_item` gets every post as it is found, with the cursor to
+    resume after it, so a listing cut off half way has kept what it found.
 
     Pinned posts come first whatever their age, so one post older than `since`
     does not end the listing: only a run of them does — Instagram pins three
@@ -237,24 +306,25 @@ def instagram_profile(account: str, limit: int, since: dt.datetime | None, proxy
 
     try:
         loader = _instaloader(proxy, count, session, user)
-        profile = instaloader.Profile.from_username(loader.context, account)
-        posts = profile.get_posts()
+        if loader.context.is_logged_in:
+            posts, describe = instaloader.Profile.from_username(loader.context, account).get_posts(), _describe_post
+        else:
+            posts, describe = _logged_out_timeline(loader.context, account), _describe_node
         if cursor:
             posts.thaw(FrozenNodeIterator(**cursor))
         out, older = [], 0
-        for post in posts:
-            taken = post.date_utc.replace(tzinfo=dt.timezone.utc)
-            if since and taken < since:
+        for raw in posts:
+            item = describe(raw)
+            taken = item["taken_at"]
+            if since and taken and taken < since:
                 older += 1
                 if older > 3:
                     break
                 continue
             older = 0
-            kind = _post_kind(post)
-            if kind == "reel" or include_images:
-                out.append({"id": post.shortcode, "url": f"https://www.instagram.com/p/{post.shortcode}/",
-                            "taken_at": taken, "kind": kind, "caption": (post.caption or "")[:2000]})
-                on_cursor(json.loads(json.dumps(posts.freeze()._asdict(), default=str)))
+            if item["kind"] == "reel" or include_images:
+                out.append(item)
+                on_item(item, json.loads(json.dumps(posts.freeze()._asdict(), default=str)))
             if len(out) >= limit:
                 break
         return out

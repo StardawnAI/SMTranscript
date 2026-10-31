@@ -91,15 +91,20 @@ class FakeFetch:
         return self.profile_items[:limit]
 
     def instagram_profile(self, account, limit, since, proxy, count, cursor=None, session=None, user=None,
-                          on_cursor=lambda c: None, include_images=False):
+                          on_item=lambda item, cursor: None, include_images=False):
         self._call("profile", proxy, count)
         self.include_images = include_images
         self.cursors_given = getattr(self, "cursors_given", []) + [cursor]
-        if self.resolve_errors:
-            # Part of the way through, as when Instagram cuts a listing off.
-            on_cursor({"node_count": 12, "remaining_data": None})
-            raise self.resolve_errors.pop(0)
-        return self.profile_items[:limit]
+        # Resuming continues after the cursor, as the real timeline does.
+        items = self.profile_items[cursor["node_count"]:] if cursor else self.profile_items
+        out = []
+        for i, item in enumerate(items[:limit]):
+            out.append(item)
+            on_item(item, {"node_count": (cursor or {}).get("node_count", 0) + i + 1, "remaining_data": None})
+            if self.resolve_errors:
+                # Part of the way through, as when Instagram cuts a listing off.
+                raise self.resolve_errors.pop(0)
+        return out
 
 
     def instagram_images(self, shortcode, proxy, count, session=None, user=None):
@@ -543,15 +548,29 @@ class EngineTest(unittest.TestCase):
 
     def test_an_interrupted_instagram_listing_resumes_at_its_cursor(self):
         self.fake.resolve_errors = [JobError("network", "Connection reset")]
-        self.fake.profile_items = [{"id": "ABC", "url": "https://www.instagram.com/p/ABC/",
-                                    "taken_at": dt.datetime(2026, 10, 29, tzinfo=dt.timezone.utc)}]
-        job, _ = self.engine.submit_profile("alice", "https://www.instagram.com/someone/", {"max_items": 1})
-        self.engine.run_once(("profile",))
+        self.fake.profile_items = [{"id": code, "url": f"https://www.instagram.com/p/{code}/", "kind": "reel",
+                                    "taken_at": dt.datetime(2026, 10, 29, tzinfo=dt.timezone.utc)}
+                                   for code in ("AAA", "BBB", "CCC")]
+        job, _ = self.engine.submit_profile("alice", "https://www.instagram.com/someone/", {"max_items": 5})
+        self.engine.run_once(("profile",))  # cut off after the first post
         self.assertEqual(self.job(job["id"])["status"], "retry_wait")
         self.engine.db.run("update job set next_at = 0 where id = ?", (job["id"],))
         self.drain()
-        self.assertEqual(self.fake.cursors_given, [None, {"node_count": 12, "remaining_data": None}])
+        self.assertEqual(self.fake.cursors_given, [None, {"node_count": 1, "remaining_data": None}])
+        result = self.engine.result(self.job(job["id"]))
+        # What was found before the cut is kept, and nothing comes twice.
+        self.assertEqual([v["id"] for v in result["videos"]], ["AAA", "BBB", "CCC"])
         self.assertEqual(self.job(job["id"])["status"], "completed")
+
+    def test_instagram_timeline_nodes_need_no_extra_query(self):
+        from smt.fetch import _describe_node
+        reel = _describe_node({"code": "DbIK-PeI9WZ", "media_type": 2, "product_type": "clips",
+                               "pk": "3753590431575330393", "caption": {"text": "Steuern sparen"}})
+        self.assertEqual((reel["kind"], reel["caption"], reel["url"]),
+                         ("reel", "Steuern sparen", "https://www.instagram.com/p/DbIK-PeI9WZ/"))
+        self.assertEqual(reel["taken_at"].year, 2025)  # the time sits inside the id
+        self.assertEqual(_describe_node({"code": "C1", "media_type": 8, "caption": None, "pk": "1"})["kind"], "carousel")
+        self.assertEqual(_describe_node({"code": "I1", "media_type": 1, "pk": "x"})["kind"], "image")
 
     def test_pictures_are_read_and_deleted(self):
         job, _ = self.engine.submit_images("alice", "https://www.instagram.com/p/CAROUSEL1/")
