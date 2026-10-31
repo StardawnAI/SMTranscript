@@ -56,6 +56,25 @@ class FakeFetch:
 
     caption_segments = staticmethod(fetch.caption_segments)
 
+    def session(self, proxy, cookiefile, max_mb, keep_media, count):
+        fake = self
+
+        class Session:
+            def __enter__(self):
+                fake.sessions = getattr(fake, "sessions", 0) + 1
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def resolve(self, url):
+                return fake.resolve(url, proxy, count, cookiefile)
+
+            def download(self, info, tmp):
+                return fake.download(info, proxy, tmp, count, cookiefile, max_mb, keep_media)
+
+        return Session()
+
     def cookie_copy(self, *_a):
         return None
 
@@ -479,16 +498,17 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(self.job(job["id"])["status"], "retry_wait")
         self.assertEqual(self.fake.proxies, ["http://warp:1080"])
 
-    def test_expired_media_link_is_resolved_once_more(self):
-        self.engine.submit_video("alice", TT)
-        self.engine.run_once(("fetch",))  # resolves and downloads
-        # Forget the file but keep the stored answer, as after a cleanup.
-        self.engine.db.run("delete from artifact")
+    def test_a_refused_download_is_tried_again_in_a_fresh_session(self):
         self.fake.download_errors = [JobError("expired_link", "HTTP Error 403: Forbidden")]
-        job, _ = self.engine.submit_video("alice", TT, {"language": "fr"})
+        job, _ = self.engine.submit_video("alice", TT)
+        self.engine.run_once(("fetch",))
+        self.assertEqual(self.job(job["id"])["status"], "retry_wait")
+        self.engine.db.run("update job set next_at = 0 where id = ?", (job["id"],))
         self.drain()
         self.assertEqual(self.job(job["id"])["status"], "completed")
-        self.assertEqual(self.fake.calls, ["resolve", "download", "download", "resolve", "download"])
+        # Resolved again, in a new session, before the second download.
+        self.assertEqual(self.fake.calls, ["resolve", "download", "resolve", "download"])
+        self.assertEqual(self.fake.sessions, 2)
 
     def test_limits(self):
         self.fake.duration = 4000

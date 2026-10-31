@@ -392,66 +392,54 @@ class Engine:
         cookie_dir = tmp_root / "session"
         cookie_dir.mkdir(parents=True, exist_ok=True)
         cookiefile = self.fetch.cookie_copy(self.s.cookies_dir, platform, cookie_dir)
-        fresh = False
         try:
-            infos = [json.loads(p["info"]) for p in parts if p.get("info")]
-            if not infos or not parts or any(_now() - (p["info_at"] or 0) > self.s.info_ttl_s for p in parts):
-                infos, fresh = self._resolve(job, target, proxy, count, cookiefile), True
+            # Resolved and downloaded in one session: the media addresses only
+            # work with the cookies their resolution got (see fetch.Session).
+            with self.fetch.session(proxy, cookiefile, self.s.max_video_mb, self.s.keep_media, count) as ses:
+                infos = self._resolve(job, target, ses)
                 parts = self._media_rows(platform, target.platform_id, target.canonical_url, infos)
-            self._set(job["id"], status="fetching")
-            for media, info in zip(parts, infos):
-                if self._video(media["id"]):
-                    continue
-                duration = info.get("duration") or 0
-                if duration > self.s.max_duration_s:
-                    raise JobError("too_large", f"{int(duration)} s is over the {self.s.max_duration_s} s limit")
-                tmp = tmp_root / f"part{media['part']}"
-                shutil.rmtree(tmp, ignore_errors=True)
-                tmp.mkdir(parents=True)
-                try:
-                    got = self._download_one(platform, route, info, proxy, tmp, count, cookiefile)
-                except JobError as err:
-                    if err.cls != "expired_link" or fresh:
-                        raise
-                    # The stored answer's media links ran out: ask once more, then try again.
-                    infos, fresh = self._resolve(job, target, proxy, count, cookiefile), True
-                    parts = self._media_rows(platform, target.platform_id, target.canonical_url, infos)
-                    info = infos[media["part"]]
+                self._set(job["id"], status="fetching")
+                for media, info in zip(parts, infos):
+                    if self._video(media["id"]):
+                        continue
+                    duration = info.get("duration") or 0
+                    if duration > self.s.max_duration_s:
+                        raise JobError("too_large", f"{int(duration)} s is over the {self.s.max_duration_s} s limit")
+                    tmp = tmp_root / f"part{media['part']}"
                     shutil.rmtree(tmp, ignore_errors=True)
                     tmp.mkdir(parents=True)
-                    got = self._download_one(platform, route, info, proxy, tmp, count, cookiefile)
-                probe = _probe_streams(got["video"])
-                # What the post is, not what was downloaded: without keep_media
-                # only its audio comes.
-                probe["video"] = probe["video"] or any(
-                    (f.get("vcodec") or "none") != "none" for f in info.get("formats") or [])
-                self._publish(media, got["video"], "video")
-                meta = json.loads(media["meta"])
-                meta.update(has_video=probe["video"], has_audio=probe["audio"],
-                            duration_seconds=meta.get("duration_seconds") or round(probe["duration"], 2))
-                self.db.run("update media set meta = ? where id = ?", (json.dumps(meta), media["id"]))
-                for track in got["captions"]:
-                    self._store_captions(media, track)
+                    got = self._download_one(platform, route, info, tmp, ses)
+                    probe = _probe_streams(got["video"])
+                    # What the post is, not what was downloaded: without keep_media
+                    # only its audio comes.
+                    probe["video"] = probe["video"] or any(
+                        (f.get("vcodec") or "none") != "none" for f in info.get("formats") or [])
+                    self._publish(media, got["video"], "video")
+                    meta = json.loads(media["meta"])
+                    meta.update(has_video=probe["video"], has_audio=probe["audio"],
+                                duration_seconds=meta.get("duration_seconds") or round(probe["duration"], 2))
+                    self.db.run("update media set meta = ? where id = ?", (json.dumps(meta), media["id"]))
+                    for track in got["captions"]:
+                        self._store_captions(media, track)
             return self._parts(platform, target.platform_id)
         finally:
             shutil.rmtree(tmp_root, ignore_errors=True)
 
-    def _resolve(self, job, target, proxy, count, cookiefile) -> list[dict]:
+    def _resolve(self, job, target, ses) -> list[dict]:
         self._set(job["id"], status="resolving")
         with self.routes.request(target.platform, job["route"]):
             try:
-                infos = self.fetch.resolve(target.canonical_url, proxy, count, cookiefile)
+                infos = ses.resolve(target.canonical_url)
             except JobError as err:
                 self.routes.record(target.platform, job["route"], err)
                 raise
             self.routes.record(target.platform, job["route"], None)
         return infos
 
-    def _download_one(self, platform, route, info, proxy, tmp, count, cookiefile) -> dict:
+    def _download_one(self, platform, route, info, tmp, ses) -> dict:
         with self.routes.request(platform, route):
             try:
-                got = self.fetch.download(info, proxy, tmp, count, cookiefile, self.s.max_video_mb,
-                                          keep_media=self.s.keep_media)
+                got = ses.download(info, tmp)
             except JobError as err:
                 self.routes.record(platform, route, err)
                 raise

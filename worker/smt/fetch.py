@@ -118,42 +118,62 @@ def cookie_copy(cookies_dir: Path | None, platform: str, tmp: Path) -> Path | No
     return dst
 
 
-def resolve(url: str, proxy: str | None, count, cookiefile: Path | None = None) -> list[dict]:
-    """The video entries behind a post: one, or several for a carousel."""
-    try:
-        with _ydl_class()(_opts(proxy, cookiefile), count) as ydl:
-            info = ydl.extract_info(url, download=False)
-            info = ydl.sanitize_info(info)
-    except Exception as exc:  # noqa: BLE001 — classified, not swallowed
-        raise classify(exc) from exc
-    entries = info.get("entries") if info.get("_type") == "playlist" else [info]
-    videos = [e for e in entries or [] if e and (e.get("formats") or e.get("url"))]
-    if not videos:
-        raise JobError("unavailable", f"{url} has no video in it")
-    return videos
+class Session:
+    """One yt-dlp instance for a job's whole fetch: resolve, then download.
+
+    Instagram ties a video's media addresses to the cookies its extraction
+    received. Resolved in one instance and downloaded in another, every
+    download from stardawneg64 failed with HTTP 403; in one instance it works
+    (measured 2026-10-31; from a Starlink address Instagram did not check).
+    """
+
+    def __init__(self, proxy: str | None, cookiefile: Path | None, max_mb: int, keep_media: bool, count):
+        self._ydl = _ydl_class()(_opts(proxy, cookiefile, Path("."), max_mb, keep_media), count)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._ydl.close()
+        return False
+
+    def resolve(self, url: str) -> list[dict]:
+        """The video entries behind a post: one, or several for a carousel."""
+        try:
+            info = self._ydl.sanitize_info(self._ydl.extract_info(url, download=False))
+        except Exception as exc:  # noqa: BLE001 — classified, not swallowed
+            raise classify(exc) from exc
+        entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+        videos = [e for e in entries or [] if e and (e.get("formats") or e.get("url"))]
+        if not videos:
+            raise JobError("unavailable", f"{url} has no video in it")
+        return videos
+
+    def download(self, info: dict, tmp: Path) -> dict:
+        """Downloads the video (or its audio) and the captions of an entry
+        this session resolved, without asking for the page again."""
+        self._ydl.params["outtmpl"]["default"] = str(tmp / "media.%(ext)s")
+        try:
+            self._ydl.process_ie_result(copy.deepcopy(info), download=True)
+        except Exception as exc:  # noqa: BLE001
+            raise classify(exc) from exc
+        video = None
+        tracks = []
+        for f in sorted(tmp.iterdir()):
+            if f.name.startswith("media.") and f.suffix in VIDEO_EXT and f.name.count(".") == 1:
+                video = f
+            elif f.suffix in CAPTION_EXT and f.name.startswith("media."):
+                # media.<language>.<ext>
+                tracks.append({"language_raw": f.name.split(".")[1], "ext": f.suffix[1:], "path": f})
+        if video is None:
+            # yt-dlp skips a file over max_filesize without raising.
+            raise JobError("too_large", f"no video file arrived (over {self._ydl.params['max_filesize'] // 2**20} MB, "
+                                        "or nothing to download)")
+        return {"video": video, "captions": tracks}
 
 
-def download(info: dict, proxy: str | None, tmp: Path, count, cookiefile: Path | None, max_mb: int,
-             keep_media: bool = True) -> dict:
-    """Downloads the video and the captions an extractor answer points at,
-    without asking the platform for the page again."""
-    try:
-        with _ydl_class()(_opts(proxy, cookiefile, tmp, max_mb, keep_media), count) as ydl:
-            ydl.process_ie_result(copy.deepcopy(info), download=True)
-    except Exception as exc:  # noqa: BLE001
-        raise classify(exc) from exc
-    video = None
-    tracks = []
-    for f in sorted(tmp.iterdir()):
-        if f.name.startswith("media.") and f.suffix in VIDEO_EXT and f.name.count(".") == 1:
-            video = f
-        elif f.suffix in CAPTION_EXT and f.name.startswith("media."):
-            # media.<language>.<ext>
-            tracks.append({"language_raw": f.name.split(".")[1], "ext": f.suffix[1:], "path": f})
-    if video is None:
-        # yt-dlp skips a file over max_filesize without raising.
-        raise JobError("too_large", f"no video file arrived (over {max_mb} MB, or nothing to download)")
-    return {"video": video, "captions": tracks}
+def session(proxy: str | None, cookiefile: Path | None, max_mb: int, keep_media: bool, count) -> Session:
+    return Session(proxy, cookiefile, max_mb, keep_media, count)
 
 
 def caption_segments(track: dict) -> list[dict]:
