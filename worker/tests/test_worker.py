@@ -72,8 +72,9 @@ class FakeFetch:
                  "timestamp": 1761800000, "formats": [{"url": "https://cdn.example/x.mp4"}]}
                 for i in range(self.entries)]
 
-    def download(self, info, proxy, tmp, count, cookiefile, max_mb):
+    def download(self, info, proxy, tmp, count, cookiefile, max_mb, keep_media=True):
         self._call("download", proxy, count)
+        self.kept = keep_media
         if self.download_errors:
             raise self.download_errors.pop(0)
         video = tmp / "media.mp4"
@@ -90,14 +91,32 @@ class FakeFetch:
         return self.profile_items[:limit]
 
     def instagram_profile(self, account, limit, since, proxy, count, cursor=None, session=None, user=None,
-                          on_cursor=lambda c: None):
+                          on_cursor=lambda c: None, include_images=False):
         self._call("profile", proxy, count)
+        self.include_images = include_images
         self.cursors_given = getattr(self, "cursors_given", []) + [cursor]
         if self.resolve_errors:
             # Part of the way through, as when Instagram cuts a listing off.
             on_cursor({"node_count": 12, "remaining_data": None})
             raise self.resolve_errors.pop(0)
         return self.profile_items[:limit]
+
+
+    def instagram_images(self, shortcode, proxy, count, session=None, user=None):
+        self._call("post", proxy, count)
+        return {"images": ["https://scontent.cdninstagram.com/1.jpg", "https://scontent.cdninstagram.com/2.jpg"],
+                "videos": 1, "caption": "3 Tipps", "author": "immo.dommi",
+                "taken_at": dt.datetime(2026, 10, 20, tzinfo=dt.timezone.utc), "kind": "carousel"}
+
+    def download_image(self, url, dest, proxy, count, max_mb=20):
+        self._call("image", proxy, count)
+        dest.write_bytes(b"jpeg")
+        self.downloaded = getattr(self, "downloaded", []) + [dest]
+        return dest
+
+
+def fake_ocr(path):
+    return {"1.jpg": "Tipp 1: Nießbrauch prüfen", "2.jpg": ""}[path.name]
 
 
 class FakeAsr:
@@ -258,7 +277,7 @@ class EngineTest(unittest.TestCase):
         self.engine = self.make()
 
     def make(self, **over):
-        engine = Engine(settings(self.data, **over), asr_factory=lambda _m: self.asr)
+        engine = Engine(settings(self.data, **over), asr_factory=lambda _m: self.asr, ocr=fake_ocr)
         engine.fetch = self.fake
         return engine
 
@@ -362,6 +381,20 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(row["status"], "partial")
         self.assertTrue(any(a["kind"] == "video" for a in self.engine.result(row)["artifacts"]))
         self.assertEqual(self.fake.calls, ["resolve", "download"])  # nothing fetched again
+
+    def test_without_keep_media_nothing_stays_but_the_text(self):
+        engine = self.make(keep_media=False)
+        job, _ = engine.submit_video("alice", TT)
+        self.drain(engine)
+        self.assertFalse(self.fake.kept)  # asked for audio only
+        result = engine.result(self.job(job["id"]))
+        self.assertEqual((result["status"], result["transcript"]["text"]), ("completed", "Hallo und willkommen."))
+        self.assertEqual(result["artifacts"], [])
+        self.assertEqual([f for f in self.data.joinpath("media").rglob("*") if f.is_file()], [])
+        again, _ = engine.submit_video("bob", TT, {"language": "fr"})
+        self.drain(engine)
+        self.assertEqual(self.job(again["id"])["platform_requests"], 0)  # the transcript answers
+        self.assertEqual(self.fake.calls, ["resolve", "download"])
 
     def test_asking_again_after_a_failure_retries_with_what_is_stored(self):
         self.asr.fail = 2
@@ -519,6 +552,40 @@ class EngineTest(unittest.TestCase):
         self.drain()
         self.assertEqual(self.fake.cursors_given, [None, {"node_count": 12, "remaining_data": None}])
         self.assertEqual(self.job(job["id"])["status"], "completed")
+
+    def test_pictures_are_read_and_deleted(self):
+        job, _ = self.engine.submit_images("alice", "https://www.instagram.com/p/CAROUSEL1/")
+        self.drain()
+        result = self.engine.result(self.job(job["id"]))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual((result["transcript"]["source"], result["transcript"]["status"]), ("ocr", "available"))
+        self.assertEqual(result["transcript"]["text"], "Tipp 1: Nießbrauch prüfen")
+        self.assertEqual([s["image"] for s in result["transcript"]["segments"]], [1, 2])
+        self.assertEqual((result["media"]["post_kind"], result["media"]["videos_not_read"]), ("carousel", 1))
+        self.assertTrue(all(not f.exists() for f in self.fake.downloaded))  # every picture deleted
+        self.assertEqual(self.job(job["id"])["platform_requests"], 3)  # the post + two pictures
+        again, _ = self.engine.submit_images("bob", "https://www.instagram.com/p/CAROUSEL1/")
+        self.drain()
+        self.assertEqual(self.job(again["id"])["platform_requests"], 0)
+        with self.assertRaises(JobError):
+            self.engine.submit_images("alice", TT)  # TikTok has no picture jobs here
+
+    def test_an_account_with_pictures(self):
+        self.fake.profile_items = [
+            {"id": "REEL1", "url": "https://www.instagram.com/p/REEL1/", "kind": "reel", "caption": "a",
+             "taken_at": dt.datetime(2026, 10, 29, tzinfo=dt.timezone.utc)},
+            {"id": "PIC1", "url": "https://www.instagram.com/p/PIC1/", "kind": "image", "caption": "b",
+             "taken_at": dt.datetime(2026, 10, 28, tzinfo=dt.timezone.utc)},
+        ]
+        job, _ = self.engine.submit_profile("alice", "https://www.instagram.com/someone/",
+                                            {"max_items": 5, "include_images": True})
+        self.drain()
+        self.assertTrue(self.fake.include_images)
+        result = self.engine.result(self.job(job["id"]))
+        self.assertEqual([(v["id"], v["kind"], v["status"]) for v in result["videos"]],
+                         [("REEL1", "reel", "completed"), ("PIC1", "image", "completed")])
+        kinds = {r["kind"] for r in self.engine.db.all("select kind from job where parent_id = ?", (job["id"],))}
+        self.assertEqual(kinds, {"video", "images"})
 
     def test_profile_limits(self):
         with self.assertRaises(JobError):

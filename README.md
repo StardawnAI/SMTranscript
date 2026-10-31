@@ -102,17 +102,17 @@ The server offers two tools: `get_youtube_transcript` for YouTube (below) and
 
 `get_youtube_transcript`:
 
-| `url_type` | `youtube_url` | Returns |
-|---|---|---|
-| `video` (default) | video link or ID (`watch?v=`, `youtu.be/`, `shorts/`, `live/`) | that video's transcript |
-| `playlist` | playlist link (contains `list=`) | files + an index, first 100 videos at most (default 25) |
-| `search` | a search phrase, not a link | files + an index, about 20 results at most (default 10) |
+| `url_type`        | `youtube_url`                                                  | Returns                                                 |
+| ----------------- | -------------------------------------------------------------- | ------------------------------------------------------- |
+| `video` (default) | video link or ID (`watch?v=`, `youtu.be/`, `shorts/`, `live/`) | that video's transcript                                 |
+| `playlist`        | playlist link (contains `list=`)                               | files + an index, first 100 videos at most (default 25) |
+| `search`          | a search phrase, not a link                                    | files + an index, about 20 results at most (default 10) |
 
 Optional: `language` (`"de"`, `"en"`, …), `max_videos`, `include_segments` (single video),
 `save_to` and `offset` (playlist and search; `offset` starts further down the list).
 
-Just ask your assistant, for example *"summarize this video: https://youtu.be/…"* or
-*"search YouTube for n8n MCP tutorials and compare what they say"*.
+Just ask your assistant, for example _"summarize this video: https://youtu.be/…"_ or
+_"search YouTube for n8n MCP tutorials and compare what they say"_.
 
 A single video answers in a few seconds:
 
@@ -127,7 +127,15 @@ A single video answers in a few seconds:
   "availableLanguages": ["en", "de"],
   "fullText": "All right, so here we are, in front of the elephants …",
   "totalSegments": 6,
-  "segments": [{ "text": "All right, so here we are, in front of the elephants", "start": "00:00:01.200", "end": "00:00:03.360", "startMs": 1200, "endMs": 3360 }]
+  "segments": [
+    {
+      "text": "All right, so here we are, in front of the elephants",
+      "start": "00:00:01.200",
+      "end": "00:00:03.360",
+      "startMs": 1200,
+      "endMs": 3360
+    }
+  ]
 }
 ```
 
@@ -138,9 +146,21 @@ answer is an index:
 
 ```json
 {
-  "totalVideos": 100, "successful": 100, "skipped": 0,
+  "totalVideos": 100,
+  "successful": 100,
+  "skipped": 0,
   "savedTo": "/your/project/yt_transcripts",
-  "videos": [{ "videoId": "OuNKBjuV7A4", "title": "…", "author": "Fireship", "durationSeconds": 403, "language": "en", "generated": true, "characters": 7508 }]
+  "videos": [
+    {
+      "videoId": "OuNKBjuV7A4",
+      "title": "…",
+      "author": "Fireship",
+      "durationSeconds": 403,
+      "language": "en",
+      "generated": true,
+      "characters": 7508
+    }
+  ]
 }
 ```
 
@@ -165,10 +185,10 @@ Such a server offers `get_social_transcript` only when it is given a worker to u
 
 `get_social_transcript` takes a TikTok or Instagram link:
 
-| Link | Returns |
-|---|---|
-| a video: `tiktok.com/@user/video/…`, `vm.tiktok.com/…`, `instagram.com/reel/…`, `/p/…` | that video's transcript, in the answer |
-| an account: `tiktok.com/@user`, `instagram.com/user/` | the newest `max_videos` (default 10, up to 100): files + an index |
+| Link                                                                                   | Returns                                                           |
+| -------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| a video: `tiktok.com/@user/video/…`, `vm.tiktok.com/…`, `instagram.com/reel/…`, `/p/…` | that video's transcript, in the answer                            |
+| an account: `tiktok.com/@user`, `instagram.com/user/`                                  | the newest `max_videos` (default 10, up to 100): files + an index |
 
 Optional: `since` (accounts: `"2026-10-01"`), `language` (prefer the platform's captions in it),
 `route` (`"direct"` or `"warp"`), `asr` (`"always"` transcribes even when there are captions),
@@ -192,13 +212,30 @@ What happens to a link:
 
 ```json
 {
-  "platform": "tiktok", "videoId": "7702580867771796758", "title": "Wegen der neuen Zuckersteuer …",
-  "author": "tagesschau", "durationSeconds": 58, "status": "completed", "transcriptStatus": "available",
-  "source": "asr", "language": "de", "model": "large-v3-turbo",
+  "platform": "tiktok",
+  "videoId": "7702580867771796758",
+  "title": "Wegen der neuen Zuckersteuer …",
+  "author": "tagesschau",
+  "durationSeconds": 58,
+  "status": "completed",
+  "transcriptStatus": "available",
+  "source": "asr",
+  "language": "de",
+  "model": "large-v3-turbo",
   "fullText": "So viel teurer könnte deine Cola durch die Zuckersteuer werden? …",
-  "totalSegments": 15, "jobId": "job_…", "video": { "artifactId": "art_…", "sha256": "…", "bytes": 2169020 },
+  "totalSegments": 15,
+  "jobId": "job_…",
+  "video": { "artifactId": "art_…", "sha256": "…", "bytes": 2169020 },
   "platformRequests": 2,
-  "segments": [{ "text": "So viel teurer könnte deine Cola durch die Zuckersteuer werden? Wir rechnen es vor.", "start": "00:00:00.000", "end": "00:00:03.780", "startMs": 0, "endMs": 3780 }]
+  "segments": [
+    {
+      "text": "So viel teurer könnte deine Cola durch die Zuckersteuer werden? Wir rechnen es vor.",
+      "start": "00:00:00.000",
+      "end": "00:00:03.780",
+      "startMs": 0,
+      "endMs": 3780
+    }
+  ]
 }
 ```
 
@@ -221,7 +258,14 @@ into the volume. After that a reel takes seconds.
 - `route: "warp"` uses the worker's own Cloudflare WARP container `smtranscript-warp`, not the
   YouTube one, so a new YouTube identity never moves a TikTok session. If WARP is down, the job
   waits; it never falls back to the direct address.
-- Limits: 500 MB per video, 30 minutes, 200 videos per account import, 2 GB of disk kept free.
+- Limits: 500 MB per video, 30 minutes, 1000 posts per account import, 2 GB of disk kept free.
+- **On a server, keep nothing but text:** `SMT_KEEP_MEDIA=0` fetches only the audio track (or the
+  smallest file where there is none), deletes it as soon as the transcript exists, and never
+  downloads that video again — the transcript answers. StarBase runs the worker this way.
+- **Picture posts and carousels (Instagram):** an account import with `include_images: true` lists
+  them too, each with its kind (`reel`, `image`, `carousel`) and caption, and reads the text on
+  every picture with Tesseract (German and English); each picture is deleted as soon as it is
+  read. Measured: an 8-slide carousel, 2,671 characters, 9 requests (the post and its pictures).
 - Private videos, and videos that need an account, are reported as such. Logged-in sessions are
   optional (`SMT_COOKIES_DIR` with `tiktok.txt` / `instagram.txt` cookie files, or an Instaloader
   session file) and stay inside the worker.
@@ -237,16 +281,16 @@ docker run -d -p 127.0.0.1:47821:8765 -e SMT_API_KEYS=me:<a long random key> \
   -v smtranscript-data:/data smtranscript-worker
 ```
 
-| Route | |
-|---|---|
-| `POST /v1/jobs` `{url, language?, route?, asr?, asr_model?, idempotency_key?}` | a video → `202 {job_id}` (the same request again: the same job) |
-| `POST /v1/profile-imports` `{url, max_items, since?, until?, …}` | an account → `202 {job_id}` |
-| `GET /v1/jobs/{id}` | status, error class, `retry_after_s` |
-| `GET /v1/jobs/{id}/result` | the result (`schema_version` 1.0), or `202` while it is not done |
-| `POST /v1/jobs/{id}/cancel` | stop it; what is stored stays |
-| `GET /v1/artifacts/{id}` | a stored file (video, captions) |
-| `GET /v1/routes`, `POST /v1/routes/unblock` | pauses and blocks per platform and route; unblocking needs an admin key |
-| `GET /healthz`, `GET /readyz` | liveness; readiness with database, ffmpeg, disk and the Whisper model |
+| Route                                                                          |                                                                         |
+| ------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `POST /v1/jobs` `{url, language?, route?, asr?, asr_model?, idempotency_key?}` | a video → `202 {job_id}` (the same request again: the same job)         |
+| `POST /v1/profile-imports` `{url, max_items, since?, until?, …}`               | an account → `202 {job_id}`                                             |
+| `GET /v1/jobs/{id}`                                                            | status, error class, `retry_after_s`                                    |
+| `GET /v1/jobs/{id}/result`                                                     | the result (`schema_version` 1.0), or `202` while it is not done        |
+| `POST /v1/jobs/{id}/cancel`                                                    | stop it; what is stored stays                                           |
+| `GET /v1/artifacts/{id}`                                                       | a stored file (video, captions)                                         |
+| `GET /v1/routes`, `POST /v1/routes/unblock`                                    | pauses and blocks per platform and route; unblocking needs an admin key |
+| `GET /healthz`, `GET /readyz`                                                  | liveness; readiness with database, ffmpeg, disk and the Whisper model   |
 
 Every call but the health checks needs `Authorization: Bearer <key>`; another caller's jobs and
 files answer 404. Settings are environment variables (`SMT_WARP_PROXY`, `SMT_ROUTE_TIKTOK`,
@@ -256,8 +300,8 @@ files answer 404. Settings are environment variables (`SMT_WARP_PROXY`, `SMT_ROU
 
 ## Cloudflare WARP
 
-YouTube tolerates a few requests from one IP and then answers *"Sign in to confirm you're
-not a bot"*. On a home connection that starts after a handful of videos in a row; on a
+YouTube tolerates a few requests from one IP and then answers _"Sign in to confirm you're
+not a bot"_. On a home connection that starts after a handful of videos in a row; on a
 cloud server, CI runner or VPN it starts at the first request. Cloudflare WARP is the
 route that keeps working: free, no account, and its exit addresses are shared with a lot of
 ordinary traffic.
@@ -285,7 +329,7 @@ an address that works a minute later.
 The very first start downloads the WARP image once (about 370 MB, half a minute on a fast
 connection); after that it starts in seconds. The container keeps running (`--restart
 unless-stopped`) and is reused. If its tunnel has silently died — the WARP daemon does that
-now and then, and the proxy port keeps forwarding *without* the tunnel — the server notices
+now and then, and the proxy port keeps forwarding _without_ the tunnel — the server notices
 and restarts it. You can also do it up front or check what's going on:
 
 ```bash

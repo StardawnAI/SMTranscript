@@ -33,7 +33,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import VERSION, fetch, guard
+from . import VERSION, fetch, guard, ocr as ocr_engine
 from .asr import Asr, extract_audio, has_audio
 from .config import Settings
 from .db import TERMINAL, Db
@@ -79,7 +79,7 @@ def _probe_streams(path: Path) -> dict:
 
 
 class Engine:
-    def __init__(self, settings: Settings, db: Db | None = None, asr_factory=None):
+    def __init__(self, settings: Settings, db: Db | None = None, asr_factory=None, ocr=None):
         self.s = settings
         self.db = db or Db(settings.db_path)
         self.routes = Routes(self.db, settings.routes, settings.gap_seconds)
@@ -94,6 +94,7 @@ class Engine:
         self.name = f"worker-{os.getpid()}-{secrets.token_hex(3)}"
         # Adapters are attributes so a test can stand in for the network.
         self.fetch = fetch
+        self.ocr = ocr or ocr_engine.read_text
 
     # ------------------------------------------------------------------
     # Accepting work
@@ -136,7 +137,7 @@ class Engine:
             "insert into job (id, tenant, kind, idem_key, input_url, platform, platform_id, canonical_url, options,"
             " status, stage, route, parent_id, created_at, updated_at)"
             " values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?) on conflict (tenant, idem_key) do nothing",
-            (job_id, tenant, kind, key, url, target.platform, target.platform_id if kind == "video" else None,
+            (job_id, tenant, kind, key, url, target.platform, target.platform_id if kind != "profile" else None,
              target.canonical_url, json.dumps(options), "profile" if kind == "profile" else "fetch",
              route, parent, now, now),
         )
@@ -152,6 +153,14 @@ class Engine:
         if target.kind == "profile":
             raise JobError("invalid_input", "this is an account, not a video — use a profile import")
         return self._insert(tenant, "video", target, url, self._options(options or {}), idem, parent)
+
+    def submit_images(self, tenant: str, url: str, options: dict | None = None, idem: str | None = None,
+                      parent: str | None = None) -> tuple[dict, bool]:
+        """A picture post or carousel: the text on its pictures."""
+        target = guard.parse(url)
+        if target.platform != "instagram" or target.kind != "video":
+            raise JobError("invalid_input", "pictures are read from Instagram post links (instagram.com/p/...)")
+        return self._insert(tenant, "images", target, url, self._options(options or {}), idem, parent)
 
     def submit_profile(self, tenant: str, url: str, options: dict | None = None,
                        idem: str | None = None) -> tuple[dict, bool]:
@@ -170,7 +179,8 @@ class Engine:
                     dt.date.fromisoformat(options[key])
                 except ValueError as exc:
                     raise JobError("invalid_input", f"{key} is a date like 2026-10-01") from exc
-        opts.update(max_items=limit, since=options.get("since"), until=options.get("until"))
+        opts.update(max_items=limit, since=options.get("since"), until=options.get("until"),
+                    include_images=bool(options.get("include_images")) and target.platform == "instagram")
         return self._insert(tenant, "profile", target, url, opts, idem)
 
     def cancel(self, job: dict) -> dict:
@@ -339,6 +349,8 @@ class Engine:
         return self._parts(platform, platform_id)
 
     def _fetch(self, job: dict):
+        if job["kind"] == "images":
+            return self._fetch_images(job)
         opts = json.loads(job["options"])
         count = self._count(job["id"])
         proxy = self.routes.proxy(job["route"])
@@ -357,12 +369,15 @@ class Engine:
             self._set(job["id"], platform_id=target.platform_id, canonical_url=target.canonical_url)
 
         parts = self._parts(target.platform, target.platform_id)
-        if not parts or any(self._video(p["id"]) is None for p in parts):
+        # A transcript that exists answers the job: no download, even when the
+        # file it was made from is long deleted.
+        known = bool(parts) and all(self._chosen(p["id"], opts) for p in parts)
+        if not known and (not parts or any(self._video(p["id"]) is None for p in parts)):
             parts = self._download(job, target, parts, proxy, count)
         self._set(job["id"], media_id=parts[0]["id"])
 
-        if all(self._chosen(p["id"], opts) for p in parts):
-            self._finish(job["id"])
+        if known or all(self._chosen(p["id"], opts) for p in parts):
+            self._finish(job["id"], parts)
         else:
             # A new stage starts its own count of attempts.
             self._set(job["id"], status="processing", stage="asr", next_at=0, attempts=0)
@@ -405,6 +420,10 @@ class Engine:
                     tmp.mkdir(parents=True)
                     got = self._download_one(platform, route, info, proxy, tmp, count, cookiefile)
                 probe = _probe_streams(got["video"])
+                # What the post is, not what was downloaded: without keep_media
+                # only its audio comes.
+                probe["video"] = probe["video"] or any(
+                    (f.get("vcodec") or "none") != "none" for f in info.get("formats") or [])
                 self._publish(media, got["video"], "video")
                 meta = json.loads(media["meta"])
                 meta.update(has_video=probe["video"], has_audio=probe["audio"],
@@ -430,7 +449,8 @@ class Engine:
     def _download_one(self, platform, route, info, proxy, tmp, count, cookiefile) -> dict:
         with self.routes.request(platform, route):
             try:
-                got = self.fetch.download(info, proxy, tmp, count, cookiefile, self.s.max_video_mb)
+                got = self.fetch.download(info, proxy, tmp, count, cookiefile, self.s.max_video_mb,
+                                          keep_media=self.s.keep_media)
             except JobError as err:
                 self.routes.record(platform, route, err)
                 raise
@@ -526,8 +546,9 @@ class Engine:
                 finally:
                     wav.unlink(missing_ok=True)
             if result is None:
-                self._set(job["id"], status="partial", stage=None, finished_at=_now(),
-                          error_class="internal", error="transcription failed; the video is stored")
+                self._drop_media(parts)
+                self._set(job["id"], status="partial", stage=None, finished_at=_now(), error_class="internal",
+                          error="transcription failed" + ("; the video is stored" if self.s.keep_media else ""))
                 return
             self.db.run(
                 "insert into track (media_id, source, language, origin, model, model_revision, params, status,"
@@ -538,10 +559,78 @@ class Engine:
             )
             for flag in result["quality"].get("flags", []):
                 self._warn(job["id"], flag)
+        self._finish(job["id"], parts)
+
+    # -- pictures ---------------------------------------------------------------
+
+    def _ocr_track(self, media_id: int) -> dict | None:
+        return self.db.one("select * from track where media_id = ? and source = 'ocr' order by created_at desc limit 1",
+                           (media_id,))
+
+    def _fetch_images(self, job: dict):
+        """Reads the text on a post's pictures. Each picture is deleted as
+        soon as it is read; the text is what stays."""
+        target = guard.parse(job["input_url"])
+        parts = self._parts("instagram", target.platform_id)
+        if parts and self._ocr_track(parts[0]["id"]):
+            self._set(job["id"], media_id=parts[0]["id"])
+            return self._finish(job["id"])
+        count = self._count(job["id"])
+        proxy = self.routes.proxy(job["route"])
+        self._set(job["id"], status="resolving")
+        with self.routes.request("instagram", job["route"]):
+            try:
+                post = self.fetch.instagram_images(target.platform_id, proxy, count,
+                                                   self.s.instaloader_session, self.s.instagram_user)
+            except JobError as err:
+                self.routes.record("instagram", job["route"], err)
+                raise
+            self.routes.record("instagram", job["route"], None)
+        meta = {"title": None, "description": post["caption"], "author": post["author"],
+                "published_at": _iso(post["taken_at"].timestamp()) if post.get("taken_at") else None,
+                "post_kind": post["kind"], "images": len(post["images"]), "videos_not_read": post["videos"],
+                "has_video": False}
+        self.db.run(
+            "insert into media (platform, platform_id, part, canonical_url, meta) values ('instagram', ?, 0, ?, ?)"
+            " on conflict (platform, platform_id, part) do update set meta = excluded.meta",
+            (target.platform_id, target.canonical_url, json.dumps(meta)))
+        media = self._parts("instagram", target.platform_id)[0]
+        self._set(job["id"], status="fetching", media_id=media["id"])
+        tmp = self.s.tmp_dir / job["id"]
+        tmp.mkdir(parents=True, exist_ok=True)
+        segments = []
+        try:
+            # Pictures come from Instagram's CDN, not its API: no route budget,
+            # but every one is counted.
+            for i, url in enumerate(post["images"], 1):
+                path = self.fetch.download_image(url, tmp / f"{i}.jpg", proxy, count)
+                text = self.ocr(path)
+                path.unlink(missing_ok=True)
+                segments.append({"image": i, "text": text})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        read = [seg for seg in segments if seg["text"]]
+        self.db.run(
+            "insert into track (media_id, source, language, origin, model, params, status, segments, text, quality,"
+            " created_at) values (?, 'ocr', null, 'pictures', ?, '{}', ?, ?, ?, ?, ?)",
+            (media["id"], ocr_engine.version() or "tesseract", "available" if read else "no_text",
+             json.dumps(segments), "\n\n".join(seg["text"] for seg in read),
+             json.dumps({"images": len(segments), "with_text": len(read)}), _now()))
         self._finish(job["id"])
 
-    def _finish(self, job_id: str):
+    def _finish(self, job_id: str, parts: list[dict] | None = None):
+        self._drop_media(parts or [])
         self._set(job_id, status="completed", stage=None, finished_at=_now(), error_class=None, error=None)
+
+    def _drop_media(self, parts: list[dict]):
+        """Without keep_media the downloaded file goes as soon as it has done
+        its work; the text tracks stay."""
+        if self.s.keep_media:
+            return
+        for media in parts:
+            for art in self.db.all("select id, path from artifact where media_id = ? and kind = 'video'", (media["id"],)):
+                (self.s.media_dir / art["path"]).unlink(missing_ok=True)
+                self.db.run("delete from artifact where id = ?", (art["id"],))
 
     # -- profiles -----------------------------------------------------------
 
@@ -577,7 +666,8 @@ class Engine:
                     else:
                         found = self.fetch.instagram_profile(
                             target.platform_id, opts["max_items"], since, proxy, count, cursor,
-                            self.s.instaloader_session, self.s.instagram_user, on_cursor=save)
+                            self.s.instaloader_session, self.s.instagram_user, on_cursor=save,
+                            include_images=opts.get("include_images", False))
                     self.routes.record(target.platform, job["route"], None)
                 except JobError as err:
                     self.routes.record(target.platform, job["route"], err)
@@ -594,11 +684,13 @@ class Engine:
                 continue
             if item["id"] in seen:
                 continue
-            child, _ = self.submit_video(job["tenant"], item["url"], {
-                "language": opts["language"], "route": opts["route"], "asr_model": opts["asr_model"],
-                "asr": opts["asr"]}, parent=job["id"])
-            items.append({"id": item["id"], "url": item["url"], "job_id": child["id"],
-                          "taken_at": taken.isoformat() if taken else None})
+            kind = item.get("kind") or "reel"
+            child_opts = {"language": opts["language"], "route": opts["route"], "asr_model": opts["asr_model"],
+                          "asr": opts["asr"]}
+            submit = self.submit_images if kind in ("image", "carousel") else self.submit_video
+            child, _ = submit(job["tenant"], item["url"], child_opts, parent=job["id"])
+            items.append({"id": item["id"], "url": item["url"], "job_id": child["id"], "kind": kind,
+                          "caption": item.get("caption"), "taken_at": taken.isoformat() if taken else None})
             seen.add(item["id"])
             save()
         save()
@@ -658,11 +750,11 @@ class Engine:
                 "model": t["model"], "model_revision": t["model_revision"], "text": t["text"],
                 "quality": json.loads(t["quality"]), "segments": json.loads(t["segments"])}
 
-    def _part_out(self, media: dict, opts: dict) -> dict:
+    def _part_out(self, media: dict, opts: dict, kind: str = "video") -> dict:
         arts = self.db.all("select id, kind, mime, size, sha256, language from artifact where media_id = ?"
                            " order by created_at", (media["id"],))
         tracks = self.db.all("select * from track where media_id = ? order by created_at", (media["id"],))
-        chosen = self._chosen(media["id"], opts)
+        chosen = self._ocr_track(media["id"]) if kind == "images" else self._chosen(media["id"], opts)
         meta = json.loads(media["meta"])
         return {
             "media": {"platform": media["platform"], "platform_id": media["platform_id"], "part": media["part"],
@@ -695,10 +787,13 @@ class Engine:
             base["videos"] = [{**i, "status": jobs.get(i["job_id"], {}).get("status")} for i in items]
             return base
         parts = self._parts(job["platform"], job["platform_id"]) if job["platform_id"] else []
-        outs = [self._part_out(p, opts) for p in parts]
+        outs = [self._part_out(p, opts, job["kind"]) for p in parts]
         asr = next((t for p in outs for t in [p["transcript"]] if t.get("source") == "asr"), None)
         base["provenance"] = {
-            "adapter": "yt_dlp", "adapter_version": fetch.adapter_version(), "worker_version": VERSION,
+            "adapter": "instaloader+tesseract" if job["kind"] == "images" else "yt_dlp",
+            "adapter_version": (ocr_engine.version() or "tesseract") if job["kind"] == "images"
+            else fetch.adapter_version(),
+            "worker_version": VERSION,
             "route": job["route"], "retrieved_at": _iso(job["finished_at"] or job["updated_at"]),
             **({"asr_model": asr["model"], "asr_model_revision": asr["model_revision"]} if asr else {}),
         }

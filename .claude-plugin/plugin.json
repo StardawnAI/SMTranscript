@@ -1,6 +1,6 @@
 {
   "name": "awg-smtranscript",
-  "version": "4.0.1",
+  "version": "4.1.0",
   "description": "Transcripts from YouTube, TikTok and Instagram. Runs locally, no API key and no account. YouTube playlists and searches go through a free Cloudflare WARP proxy; TikTok and Instagram videos are downloaded, kept and transcribed with Whisper in a Docker worker the plugin starts itself (needs Docker).",
   "author": {
     "name": "Stardawn AI",

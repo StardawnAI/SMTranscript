@@ -51,6 +51,9 @@ class Settings:
     # Models a caller may ask for besides asr_model. Each one asked for stays
     # loaded, so the list is the memory budget, not a menu.
     asr_models: tuple = ()
+    # Off on a server: only the audio is fetched, and it is deleted as soon as the
+    # transcript exists. What stays is the link and the text.
+    keep_media: bool = True
 
     @property
     def db_path(self) -> Path:
@@ -113,11 +116,12 @@ def load() -> Settings:
         asr_workers=_int("SMT_ASR_WORKERS", 1),
         max_video_mb=_int("SMT_MAX_VIDEO_MB", 500),
         max_duration_s=_int("SMT_MAX_DURATION", 1800),
-        max_profile_items=_int("SMT_MAX_PROFILE_ITEMS", 200),
+        max_profile_items=_int("SMT_MAX_PROFILE_ITEMS", 1000),
         min_free_mb=_int("SMT_MIN_FREE_MB", 2048),
         asr_model=os.environ.get("SMT_ASR_MODEL", "large-v3-turbo"),
         asr_device=os.environ.get("SMT_ASR_DEVICE", "auto"),
         asr_models=tuple(m.strip() for m in os.environ.get("SMT_ASR_MODELS", "small").split(",") if m.strip()),
+        keep_media=os.environ.get("SMT_KEEP_MEDIA", "1") != "0",
         cookies_dir=Path(cookies) if cookies else None,
         instaloader_session=Path(session) if session else None,
         instagram_user=os.environ.get("SMT_INSTAGRAM_USER") or None,

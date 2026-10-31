@@ -68,7 +68,8 @@ def _impersonate():
         return None
 
 
-def _opts(proxy: str | None, cookiefile: Path | None, tmp: Path | None = None, max_mb: int = 500) -> dict:
+def _opts(proxy: str | None, cookiefile: Path | None, tmp: Path | None = None, max_mb: int = 500,
+          keep_media: bool = True) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -92,7 +93,9 @@ def _opts(proxy: str | None, cookiefile: Path | None, tmp: Path | None = None, m
     if tmp:
         opts.update({
             "outtmpl": {"default": str(tmp / "media.%(ext)s")},
-            "format": "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+            # Kept: the video. Not kept: only what the transcript needs — the
+            # audio track where there is one (Instagram), else the smallest file.
+            "format": "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" if keep_media else "ba/worst",
             "merge_output_format": "mp4",
             "writesubtitles": True,
             "writeautomaticsub": True,
@@ -130,11 +133,12 @@ def resolve(url: str, proxy: str | None, count, cookiefile: Path | None = None) 
     return videos
 
 
-def download(info: dict, proxy: str | None, tmp: Path, count, cookiefile: Path | None, max_mb: int) -> dict:
+def download(info: dict, proxy: str | None, tmp: Path, count, cookiefile: Path | None, max_mb: int,
+             keep_media: bool = True) -> dict:
     """Downloads the video and the captions an extractor answer points at,
     without asking the platform for the page again."""
     try:
-        with _ydl_class()(_opts(proxy, cookiefile, tmp, max_mb), count) as ydl:
+        with _ydl_class()(_opts(proxy, cookiefile, tmp, max_mb, keep_media), count) as ydl:
             ydl.process_ie_result(copy.deepcopy(info), download=True)
     except Exception as exc:  # noqa: BLE001
         raise classify(exc) from exc
@@ -211,10 +215,18 @@ def _instaloader(proxy: str | None, count, session: Path | None, user: str | Non
     return loader
 
 
+def _post_kind(post) -> str:
+    if post.is_video:
+        return "reel"
+    return "carousel" if post.typename == "GraphSidecar" else "image"
+
+
 def instagram_profile(account: str, limit: int, since: dt.datetime | None, proxy: str | None, count,
                       cursor: dict | None = None, session: Path | None = None, user: str | None = None,
-                      on_cursor=lambda c: None) -> list[dict]:
-    """Up to `limit` videos of an account, newest first.
+                      on_cursor=lambda c: None, include_images: bool = False) -> list[dict]:
+    """Up to `limit` posts of an account, newest first: its reels, and with
+    `include_images` its picture posts and carousels too, each with its kind
+    and caption.
 
     Pinned posts come first whatever their age, so one post older than `since`
     does not end the listing: only a run of them does — Instagram pins three
@@ -238,9 +250,10 @@ def instagram_profile(account: str, limit: int, since: dt.datetime | None, proxy
                     break
                 continue
             older = 0
-            if post.is_video:
+            kind = _post_kind(post)
+            if kind == "reel" or include_images:
                 out.append({"id": post.shortcode, "url": f"https://www.instagram.com/p/{post.shortcode}/",
-                            "taken_at": taken})
+                            "taken_at": taken, "kind": kind, "caption": (post.caption or "")[:2000]})
                 on_cursor(json.loads(json.dumps(posts.freeze()._asdict(), default=str)))
             if len(out) >= limit:
                 break
@@ -248,11 +261,62 @@ def instagram_profile(account: str, limit: int, since: dt.datetime | None, proxy
     except JobError:
         raise
     except Exception as exc:  # noqa: BLE001
-        name = type(exc).__name__
-        if name == "ProfileNotExistsException":
-            raise JobError("unavailable", str(exc)) from exc
-        if name == "PrivateProfileNotFollowedException":
-            raise JobError("private", str(exc)) from exc
-        if name in ("LoginRequiredException", "LoginException"):
-            raise JobError("login_required", str(exc)) from exc
+        raise _instaloader_error(exc) from exc
+
+
+def _instaloader_error(exc: Exception) -> JobError:
+    name = type(exc).__name__
+    if name == "ProfileNotExistsException":
+        return JobError("unavailable", str(exc))
+    if name == "PrivateProfileNotFollowedException":
+        return JobError("private", str(exc))
+    if name in ("LoginRequiredException", "LoginException"):
+        return JobError("login_required", str(exc))
+    return classify(exc)
+
+
+def instagram_images(shortcode: str, proxy: str | None, count, session: Path | None = None,
+                     user: str | None = None) -> dict:
+    """The pictures of a picture post or carousel: their addresses, and what
+    the post says about itself. Videos inside a carousel are counted, not
+    fetched — they are not what a picture job reads."""
+    import instaloader
+
+    try:
+        loader = _instaloader(proxy, count, session, user)
+        post = instaloader.Post.from_shortcode(loader.context, shortcode)
+        nodes = list(post.get_sidecar_nodes()) if post.typename == "GraphSidecar" else []
+        if nodes:
+            urls = [n.display_url for n in nodes if not n.is_video]
+            videos = sum(1 for n in nodes if n.is_video)
+        else:
+            urls, videos = ([] if post.is_video else [post.url]), int(post.is_video)
+        return {
+            "images": urls[:20], "videos": videos, "caption": post.caption or "",
+            "author": post.owner_username, "taken_at": post.date_utc.replace(tzinfo=dt.timezone.utc),
+            "kind": _post_kind(post),
+        }
+    except JobError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _instaloader_error(exc) from exc
+
+
+def download_image(url: str, dest: Path, proxy: str | None, count, max_mb: int = 20) -> Path:
+    """One picture from Instagram's CDN, size-capped."""
+    import urllib.request
+
+    host = (urllib.request.urlparse(url).hostname or "").lower()
+    if not (host.endswith(".cdninstagram.com") or host.endswith(".fbcdn.net")):
+        raise JobError("parser", f"a picture address outside Instagram's CDN: {host}")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
+    count()
+    try:
+        with opener.open(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30) as resp:
+            data = resp.read(max_mb * 1024 * 1024 + 1)
+    except Exception as exc:  # noqa: BLE001
         raise classify(exc) from exc
+    if len(data) > max_mb * 1024 * 1024:
+        raise JobError("too_large", f"a picture over {max_mb} MB")
+    dest.write_bytes(data)
+    return dest
