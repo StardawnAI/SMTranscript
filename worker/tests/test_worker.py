@@ -530,6 +530,21 @@ class EngineTest(unittest.TestCase):
         self.drain(other)
         self.assertEqual(self.job(job["id"])["status"], "completed")
 
+    def test_videos_are_fetched_just_in_time_for_whisper(self):
+        engine = self.make(asr_backlog=2)
+        a, _ = engine.submit_video("alice", "https://www.tiktok.com/@x/video/1")
+        b, _ = engine.submit_video("alice", "https://www.tiktok.com/@x/video/2")
+        c, _ = engine.submit_video("alice", "https://www.tiktok.com/@x/video/3")
+        pic, _ = engine.submit_images("alice", "https://www.instagram.com/p/PIC9/")
+        engine.run_once(("fetch",))
+        engine.run_once(("fetch",))  # two files now wait for Whisper
+        self.assertEqual([self.job(j["id"])["stage"] for j in (a, b, c)], ["asr", "asr", "fetch"])
+        claimed = engine.claim(("fetch",))
+        self.assertEqual(claimed["id"], pic["id"])  # pictures are not held back; the third video is
+        engine.run_once(("asr",))  # one transcribed, its file gone
+        self.drain(engine)
+        self.assertEqual(self.job(c["id"])["status"], "completed")
+
     def test_cancel(self):
         job, _ = self.engine.submit_video("alice", TT)
         self.engine.cancel(self.job(job["id"]))

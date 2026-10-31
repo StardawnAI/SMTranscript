@@ -212,13 +212,20 @@ class Engine:
     def claim(self, stages: tuple[str, ...]) -> dict | None:
         now = _now()
         marks = ",".join("?" * len(stages))
+        # A video is fetched only when Whisper is about to need it: with more
+        # than asr_backlog files already waiting for transcription, video
+        # fetches wait. So downloaded audio is never stockpiled on disk, and
+        # an account's requests to the platform spread out over the run.
         job = self.db.one(
             f"update job set lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated_at = ? "
             f"where id = (select id from job where stage in ({marks}) and next_at <= ? "
             f" and status in ('queued','resolving','fetching','processing','retry_wait') "
-            f" and (lease_until is null or lease_until < ?) order by created_at limit 1) "
+            f" and (lease_until is null or lease_until < ?) "
+            f" and (stage != 'fetch' or kind != 'video' "
+            f"      or (select count(*) from job w where w.stage = 'asr') < ?) "
+            f" order by created_at limit 1) "
             f"returning *",
-            (self.name, now + LEASE_S, now, *stages, now, now),
+            (self.name, now + LEASE_S, now, *stages, now, now, self.s.asr_backlog),
         )
         if job:
             with self._held_lock:

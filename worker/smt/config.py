@@ -54,6 +54,8 @@ class Settings:
     # Off on a server: only the audio is fetched, and it is deleted as soon as the
     # transcript exists. What stays is the link and the text.
     keep_media: bool = True
+    # Video fetches wait while this many files already wait for Whisper.
+    asr_backlog: int = 3
 
     @property
     def db_path(self) -> Path:
@@ -122,6 +124,7 @@ def load() -> Settings:
         asr_device=os.environ.get("SMT_ASR_DEVICE", "auto"),
         asr_models=tuple(m.strip() for m in os.environ.get("SMT_ASR_MODELS", "small").split(",") if m.strip()),
         keep_media=os.environ.get("SMT_KEEP_MEDIA", "1") != "0",
+        asr_backlog=_int("SMT_ASR_BACKLOG", 3),
         cookies_dir=Path(cookies) if cookies else None,
         instaloader_session=Path(session) if session else None,
         instagram_user=os.environ.get("SMT_INSTAGRAM_USER") or None,
