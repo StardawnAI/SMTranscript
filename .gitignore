@@ -21,3 +21,4 @@ __pycache__/
 # what the tool writes into a working directory
 sm_transcripts/
 yt_transcripts/
+docs/security/
