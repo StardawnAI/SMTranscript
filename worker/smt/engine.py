@@ -791,8 +791,7 @@ class Engine:
         # MCP tools take up to 100): a 1000-post import must not hold up everyone else.
         waiting = job["priority"] and opts["max_items"] <= MAX_PRIORITY_ITEMS
         child_opts = {"language": opts["language"], "route": opts["route"], "asr_model": opts["asr_model"],
-                      "asr": opts["asr"], "priority": "high" if waiting else "normal",
-                      **{k: opts[k] for k in ("describe_images", "describe_video") if opts.get(k)}}
+                      "asr": opts["asr"], "priority": "high" if waiting else "normal"}
 
         def take(item, cur=None):
             """One listed post: its own job, and kept with the cursor right away."""
@@ -802,8 +801,14 @@ class Engine:
             if taken and ((since and taken < since) or (until and taken >= until)):
                 return
             kind = item.get("kind") or "reel"
-            submit = self.submit_images if kind in ("image", "carousel") else self.submit_video
-            child, _ = submit(job["tenant"], item["url"], child_opts, parent=job["id"])
+            pictures = kind in ("image", "carousel")
+            submit = self.submit_images if pictures else self.submit_video
+            # Each post gets the model that can describe it, and only that one, so
+            # the same post asked for on its own is the same job.
+            wanted = "describe_images" if pictures else "describe_video"
+            child, _ = submit(job["tenant"], item["url"],
+                              {**child_opts, **({wanted: opts[wanted]} if opts.get(wanted) else {})},
+                              parent=job["id"])
             items.append({"id": item["id"], "url": item["url"], "job_id": child["id"], "kind": kind,
                           "caption": item.get("caption"), "taken_at": taken.isoformat() if taken else None})
             seen.add(item["id"])

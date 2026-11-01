@@ -849,6 +849,26 @@ class EngineTest(unittest.TestCase):
         self.assertNotEqual(plain["id"], described["id"])
         self.assertEqual(self.engine.submit_video("alice", TT)[0]["id"], plain["id"])  # old keys unchanged
 
+    def test_an_account_import_gives_each_post_the_model_that_fits_it(self):
+        self.fake.profile_items = [
+            {"id": "REEL7", "url": "https://www.instagram.com/p/REEL7/", "kind": "reel"},
+            {"id": "PIC7", "url": "https://www.instagram.com/p/PIC7/", "kind": "image"},
+        ]
+        job, _ = self.engine.submit_profile("alice", "https://www.instagram.com/someone/", {
+            "max_items": 2, "include_images": True,
+            "describe_images": "claude-haiku-5-5", "describe_video": "gemini-3.8-flash"})
+        self.engine.run_once(("profile",))
+        kids = {r["kind"]: json.loads(r["options"]) for r in
+                self.engine.db.all("select kind, options from job where parent_id = ?", (job["id"],))}
+        self.assertEqual((kids["video"].get("describe_video"), kids["video"].get("describe_images")),
+                         ("gemini-3.8-flash", None))
+        self.assertEqual((kids["images"].get("describe_images"), kids["images"].get("describe_video")),
+                         ("claude-haiku-5-5", None))
+        # The same post asked for on its own is the same job.
+        alone, existing = self.engine.submit_images("alice", "https://www.instagram.com/p/PIC7/",
+                                                    {"describe_images": "claude-haiku-5-5"})
+        self.assertTrue(existing)
+
     def test_an_account_with_pictures(self):
         self.fake.profile_items = [
             {"id": "REEL1", "url": "https://www.instagram.com/p/REEL1/", "kind": "reel", "caption": "a",
