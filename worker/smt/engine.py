@@ -46,6 +46,7 @@ LEASE_S = 90
 # Instagram's picture links are signed and expire after some days; a caller who
 # waits for the pictures gets links younger than this.
 IMAGE_LINKS_FRESH_S = 6 * 3600
+MAX_PRIORITY_ITEMS = 100
 MAX_ATTEMPTS = 5
 ACTIVE = ("queued", "resolving", "fetching", "processing", "retry_wait", "blocked")
 
@@ -699,8 +700,11 @@ class Engine:
                 (job["id"], json.dumps(cur) if cur else None, json.dumps(items)))
 
         seen = {i["id"] for i in items}
+        # A waiting caller's import goes first only while it is a caller's size (the
+        # MCP tools take up to 100): a 1000-post import must not hold up everyone else.
+        waiting = job["priority"] and opts["max_items"] <= MAX_PRIORITY_ITEMS
         child_opts = {"language": opts["language"], "route": opts["route"], "asr_model": opts["asr_model"],
-                      "asr": opts["asr"], "priority": "high" if job["priority"] else "normal"}
+                      "asr": opts["asr"], "priority": "high" if waiting else "normal"}
 
         def take(item, cur=None):
             """One listed post: its own job, and kept with the cursor right away."""

@@ -64,7 +64,10 @@ def _vimeo(host: str, url: str, path: str) -> Target:
     hash_ = hash_ or (query.group(1) if query else None)
     # vimeo.com pages need a login in yt-dlp 2026.10.26; the player address does
     # not (measured 2026-11-01, logged out, from the worker image).
-    return Target("vimeo", "video", video_id, f"https://vimeo.com/{video_id}" + (f"/{hash_}" if hash_ else ""),
+    # An unlisted video's hash is part of its id: stored media is keyed by the id,
+    # and a caller who knows only the number must not get what was fetched with the hash.
+    return Target("vimeo", "video", f"{video_id}:{hash_}" if hash_ else video_id,
+                  f"https://vimeo.com/{video_id}" + (f"/{hash_}" if hash_ else ""),
                   f"https://player.vimeo.com/video/{video_id}" + (f"?h={hash_}" if hash_ else ""))
 
 

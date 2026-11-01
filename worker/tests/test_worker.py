@@ -194,7 +194,7 @@ class GuardTest(unittest.TestCase):
             "https://www.instagram.com/tagesschau/reels/": ("instagram", "profile", "tagesschau"),
             "https://vimeo.com/76979871": ("vimeo", "video", "76979871"),
             "https://vimeo.com/channels/staffpicks/76979871": ("vimeo", "video", "76979871"),
-            "https://player.vimeo.com/video/76979871?h=8272103f6e": ("vimeo", "video", "76979871"),
+            "https://player.vimeo.com/video/76979871?h=8272103f6e": ("vimeo", "video", "76979871:8272103f6e"),
         }
         for url, want in cases.items():
             t = guard.parse(url)
@@ -612,6 +612,17 @@ class EngineTest(unittest.TestCase):
         self.drain(engine)
         self.assertEqual(engine.result(self.job(again["id"]))["transcript"]["text"], "Hier bei Vimeo")
 
+    def test_an_unlisted_vimeo_video_is_not_handed_out_by_its_number_alone(self):
+        engine = self.make(keep_media=False)
+        owner, _ = engine.submit_video("alice", "https://vimeo.com/76979871/8272103f6e")
+        self.drain(engine)
+        self.assertEqual(self.job(owner["id"])["status"], "completed")
+        self.fake.calls = []
+        guess, _ = engine.submit_video("bob", "https://vimeo.com/76979871")
+        self.drain(engine)
+        self.assertEqual(self.fake.calls[:1], ["resolve"])  # fetched for bob, not taken from alice's
+        self.assertNotIn("8272103f6e", json.dumps(engine.result(self.job(guess["id"]))))
+
     def test_captions_that_say_nothing_fall_back_to_the_audio(self):
         engine = self.make(keep_media=False)
         self.fake.listed_subtitles = {"en": [{"ext": "vtt"}]}
@@ -657,6 +668,22 @@ class EngineTest(unittest.TestCase):
         self.drain()
         self.assertEqual(self.fake.calls.count("download"), 4)  # three before, one new
         self.assertEqual(self.engine.status(self.job(again["id"]))["videos"]["total"], 4)
+
+    def test_only_a_callers_size_of_import_goes_first(self):
+        import smt.engine as engine_module
+        self.fake.profile_items = [{"id": str(v), "url": f"https://www.tiktok.com/@someone/video/{v}"} for v in (1, 2, 3)]
+        small, _ = self.engine.submit_profile("alice", "https://www.tiktok.com/@someone", {"max_items": 3, "priority": "high"})
+        self.engine.run_once(("profile",))
+        kids = self.engine.db.all("select priority from job where parent_id = ?", (small["id"],))
+        self.assertEqual([k["priority"] for k in kids], [1, 1, 1])
+        saved, engine_module.MAX_PRIORITY_ITEMS = engine_module.MAX_PRIORITY_ITEMS, 2
+        try:
+            big, _ = self.engine.submit_profile("bob", "https://www.tiktok.com/@someone", {"max_items": 3, "priority": "high"})
+            self.engine.run_once(("profile",))
+        finally:
+            engine_module.MAX_PRIORITY_ITEMS = saved
+        kids = self.engine.db.all("select priority from job where parent_id = ?", (big["id"],))
+        self.assertEqual([k["priority"] for k in kids], [0, 0, 0])  # bulk-sized: no head start
 
     def test_an_interrupted_instagram_listing_resumes_at_its_cursor(self):
         self.fake.resolve_errors = [JobError("network", "Connection reset")]
