@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { readConfig, writeConfig } from './config.mjs';
 import { warpRunFlags } from './warp.mjs';
 
-export const WORKER_VERSION = '1.2.2';
+export const WORKER_VERSION = '1.3.0';
 export const WORKER = 'smtranscript-worker';
 export const NETWORK = 'smtranscript';
 export const WARP = 'smtranscript-warp';

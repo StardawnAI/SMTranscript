@@ -284,6 +284,14 @@ into the volume. After that a reel takes seconds.
   them too, each with its kind (`reel`, `image`, `carousel`) and caption, and reads the text on
   every picture with Tesseract (German and English); each picture is deleted as soon as it is
   read. Measured: an 8-slide carousel, 2,671 characters, 9 requests (the post and its pictures).
+- **What is shown, not only what is said:** a job with `"describe_images": "<model>"` (Claude,
+  Gemini or OpenAI) gets, per picture, what is shown, what happens and the text on it; a job
+  with `"describe_video": "<Gemini model>"` gets what happens in the video, scene by scene -
+  Gemini watches a small copy (picture and sound) that is deleted right after. The result's
+  `understanding` holds it. Keys in `SMT_ANTHROPIC_API_KEY`, `SMT_GEMINI_API_KEY`,
+  `SMT_OPENAI_API_KEY`; a provider without a key is refused when the job is made. Asking
+  again with another model is a new job; what is known already (the transcript, the text on
+  the pictures) is not made again.
 - **Somebody waiting goes first:** a job with `"priority": "high"` (the MCP tools send it) is
   claimed before bulk work on the same worker, and its video is fetched at once.
 - Private videos, and videos that need an account, are reported as such. Logged-in sessions are

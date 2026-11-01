@@ -69,7 +69,7 @@ def _impersonate():
 
 
 def _opts(proxy: str | None, cookiefile: Path | None, tmp: Path | None = None, max_mb: int = 500,
-          keep_media: bool = True) -> dict:
+          keep_media: bool = True, want_video: bool = False) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -95,7 +95,10 @@ def _opts(proxy: str | None, cookiefile: Path | None, tmp: Path | None = None, m
             "outtmpl": {"default": str(tmp / "media.%(ext)s")},
             # Kept: the video. Not kept: only what the transcript needs — the
             # audio track where there is one (Instagram), else the smallest file.
-            "format": "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" if keep_media else "ba/worst",
+            # A video to be described: a small copy with picture and sound.
+            "format": ("bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" if keep_media
+                       else "b[height<=480][vcodec!=none][acodec!=none]/bv*[height<=480]+ba/worst[vcodec!=none]/worst"
+                       if want_video else "ba/worst"),
             "merge_output_format": "mp4",
             "writesubtitles": True,
             "writeautomaticsub": True,
@@ -127,8 +130,9 @@ class Session:
     (measured 2026-10-31; from a Starlink address Instagram did not check).
     """
 
-    def __init__(self, proxy: str | None, cookiefile: Path | None, max_mb: int, keep_media: bool, count):
-        self._ydl = _ydl_class()(_opts(proxy, cookiefile, Path("."), max_mb, keep_media), count)
+    def __init__(self, proxy: str | None, cookiefile: Path | None, max_mb: int, keep_media: bool, count,
+                 want_video: bool = False):
+        self._ydl = _ydl_class()(_opts(proxy, cookiefile, Path("."), max_mb, keep_media, want_video), count)
 
     def __enter__(self):
         return self
@@ -180,8 +184,9 @@ class Session:
         return {"video": video, "captions": tracks}
 
 
-def session(proxy: str | None, cookiefile: Path | None, max_mb: int, keep_media: bool, count) -> Session:
-    return Session(proxy, cookiefile, max_mb, keep_media, count)
+def session(proxy: str | None, cookiefile: Path | None, max_mb: int, keep_media: bool, count,
+            want_video: bool = False) -> Session:
+    return Session(proxy, cookiefile, max_mb, keep_media, count, want_video)
 
 
 def caption_segments(track: dict) -> list[dict]:

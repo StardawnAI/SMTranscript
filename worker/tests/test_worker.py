@@ -57,8 +57,9 @@ class FakeFetch:
 
     caption_segments = staticmethod(fetch.caption_segments)
 
-    def session(self, proxy, cookiefile, max_mb, keep_media, count):
+    def session(self, proxy, cookiefile, max_mb, keep_media, count, want_video=False):
         fake = self
+        fake.wanted_video = want_video
 
         class Session:
             def __enter__(self):
@@ -140,6 +141,25 @@ class FakeFetch:
         dest.write_bytes(b"jpeg")
         self.downloaded = getattr(self, "downloaded", []) + [dest]
         return dest
+
+
+class FakeUnderstand:
+    """Stands in for understand.py: no model is called."""
+
+    provider = staticmethod(__import__("smt.understand", fromlist=["provider"]).provider)
+
+    def __init__(self):
+        self.images, self.videos, self.fail_video = [], [], []
+
+    def describe_image(self, model, data, mime, keys):
+        self.images.append((model, mime, len(data)))
+        return f"Shown: slide {len(self.images)}\nText: -"
+
+    def describe_video(self, model, data, mime, keys):
+        self.videos.append((model, mime, len(data)))
+        if self.fail_video:
+            raise self.fail_video.pop(0)
+        return "0:00 Ein Mann zeigt einen Grundriss."
 
 
 def fake_ocr(path):
@@ -319,6 +339,8 @@ class EngineTest(unittest.TestCase):
     def make(self, **over):
         engine = Engine(settings(self.data, **over), asr_factory=lambda _m: self.asr, ocr=fake_ocr)
         engine.fetch = self.fake
+        engine.understand = self.understand = FakeUnderstand()
+        engine.model_keys = {"gemini": "g", "anthropic": "a"}
         return engine
 
     def drain(self, engine=None):
@@ -743,6 +765,89 @@ class EngineTest(unittest.TestCase):
         result = self.engine.result(self.job(waiting["id"]))
         self.assertEqual((result["status"], result["transcript"]["text"]), ("completed", "Tipp 1: Nießbrauch prüfen"))
         self.assertEqual(len(result["media"]["image_urls"]), 2)
+
+    def test_pictures_are_described_by_the_chosen_model(self):
+        job, _ = self.engine.submit_images("alice", "https://www.instagram.com/p/CAROUSEL3/",
+                                           {"describe_images": "claude-haiku-5-5"})
+        self.drain()
+        result = self.engine.result(self.job(job["id"]))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["transcript"]["source"], "ocr")  # the text read off stays as it was
+        u = result["understanding"]
+        self.assertEqual((u["source"], u["model"], len(u["segments"])), ("vision", "claude-haiku-5-5", 2))
+        self.assertIn("Slide 1:", u["text"])
+        self.assertEqual([m for m, _, _ in self.understand.images], ["claude-haiku-5-5"] * 2)
+        self.assertTrue(all(not f.exists() for f in self.fake.downloaded))  # pictures deleted after
+
+    def test_a_model_without_credit_leaves_the_text_of_the_pictures(self):
+        def broke(*_a):
+            raise JobError("internal", "the model provider's credit is used up - top it up, then ask again")
+        self.understand.describe_image = broke
+        job, _ = self.engine.submit_images("alice", "https://www.instagram.com/p/CAROUSEL5/",
+                                           {"describe_images": "gemini-3.8-flash"})
+        self.drain()
+        row = self.job(job["id"])
+        result = self.engine.result(row)
+        self.assertEqual((result["status"], result["transcript"]["text"]), ("completed", "Tipp 1: Nießbrauch prüfen"))
+        self.assertNotIn("understanding", result)
+        self.assertTrue(any("credit is used up" in w for w in result["warnings"]))
+
+    def test_a_description_asked_for_later_reads_no_text_again(self):
+        self.engine.submit_images("alice", "https://www.instagram.com/p/CAROUSEL4/")
+        self.drain()
+        calls_before = list(self.fake.calls)
+        job, _ = self.engine.submit_images("alice", "https://www.instagram.com/p/CAROUSEL4/",
+                                           {"describe_images": "gemini-3.8-flash"})  # another job: options differ
+        self.drain()
+        result = self.engine.result(self.job(job["id"]))
+        self.assertEqual(result["understanding"]["model"], "gemini-3.8-flash")
+        self.assertEqual(self.fake.calls[len(calls_before):], ["post", "image", "image"])  # fetched again for the model
+        self.assertEqual(result["transcript"]["text"], "Tipp 1: Nießbrauch prüfen")  # OCR not run a second time
+
+    def test_a_reel_is_watched_by_gemini_and_then_deleted(self):
+        engine = self.make(keep_media=False)
+        job, _ = engine.submit_video("alice", TT, {"describe_video": "gemini-3.8-flash"})
+        self.drain(engine)
+        result = engine.result(self.job(job["id"]))
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(self.fake.wanted_video)  # a small copy with picture, not only the audio
+        self.assertEqual(result["understanding"]["text"], "0:00 Ein Mann zeigt einen Grundriss.")
+        self.assertEqual(result["transcript"]["source"], "asr")
+        self.assertEqual([f for f in self.data.joinpath("media").rglob("*") if f.is_file()], [])
+
+    def test_a_transcribed_reel_gets_its_description_without_a_second_transcript(self):
+        engine = self.make(keep_media=False)
+        engine.submit_video("alice", TT)
+        self.drain(engine)
+        job, _ = engine.submit_video("alice", TT, {"describe_video": "gemini-3.8-flash"})
+        self.drain(engine)
+        self.assertEqual(self.asr.calls, 1)
+        self.assertEqual(engine.result(self.job(job["id"]))["understanding"]["model"], "gemini-3.8-flash")
+        self.assertEqual(self.fake.calls, ["resolve", "download", "resolve", "download"])
+
+    def test_a_busy_model_is_asked_again_later(self):
+        engine = self.make(keep_media=False)
+        self.understand.fail_video = [JobError("network", "model API HTTP 429: busy")]
+        job, _ = engine.submit_video("alice", TT, {"describe_video": "gemini-3.8-flash"})
+        engine.run_once(("fetch",))
+        engine.run_once(("asr",))
+        self.assertEqual(self.job(job["id"])["status"], "retry_wait")
+        engine.db.run("update job set next_at = 0 where id = ?", (job["id"],))
+        engine.run_once(("asr",))
+        self.assertEqual(self.job(job["id"])["status"], "completed")
+        self.assertEqual(self.asr.calls, 1)  # the transcript was kept, only the model asked again
+        self.assertEqual(len(self.understand.videos), 2)
+
+    def test_understanding_options_are_checked(self):
+        for options in ({"describe_video": "claude-sonnet-5-5"},  # cannot watch videos
+                        {"describe_images": "gpt-6-luna"},  # no OpenAI key on this worker
+                        {"describe_images": "gemini; rm -rf /"}):
+            with self.assertRaises(JobError, msg=str(options)):
+                self.engine.submit_video("alice", TT, options)
+        plain, _ = self.engine.submit_video("alice", TT)
+        described, _ = self.engine.submit_video("alice", TT, {"describe_video": "gemini-3.8-flash"})
+        self.assertNotEqual(plain["id"], described["id"])
+        self.assertEqual(self.engine.submit_video("alice", TT)[0]["id"], plain["id"])  # old keys unchanged
 
     def test_an_account_with_pictures(self):
         self.fake.profile_items = [

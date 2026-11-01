@@ -26,6 +26,7 @@ import logging
 import mimetypes
 import os
 import random
+import re
 import secrets
 import shutil
 import subprocess
@@ -33,6 +34,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import understand as understand_engine
 from . import VERSION, fetch, guard, ocr as ocr_engine
 from .asr import Asr, extract_audio, has_audio
 from .config import Settings
@@ -57,6 +59,15 @@ def _now() -> float:
 
 def _iso(ts: float | None) -> str | None:
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat().replace("+00:00", "Z") if ts else None
+
+
+def _image_mime(path: Path) -> str:
+    head = path.read_bytes()[:12]
+    if head.startswith(b"\x89PNG"):
+        return "image/png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
 
 
 def _priority(options: dict | None) -> int:
@@ -107,6 +118,8 @@ class Engine:
         # Adapters are attributes so a test can stand in for the network.
         self.fetch = fetch
         self.ocr = ocr or ocr_engine.read_text
+        self.understand = understand_engine
+        self.model_keys = understand_engine.available()
 
     # ------------------------------------------------------------------
     # Accepting work
@@ -124,7 +137,21 @@ class Engine:
         if asr not in ("auto", "always"):
             raise JobError("invalid_input", 'asr is "auto" (captions first) or "always"')
         language = options.get("language")
-        return {"language": language.lower() if language else None, "route": route, "asr_model": model, "asr": asr}
+        out = {"language": language.lower() if language else None, "route": route, "asr_model": model, "asr": asr}
+        # Understanding: only when asked, so a job without it keeps its old key.
+        for name in ("describe_images", "describe_video"):
+            wanted = options.get(name)
+            if not wanted:
+                continue
+            if not re.fullmatch(r"[a-z0-9][a-z0-9.\-]{1,80}", str(wanted)):
+                raise JobError("invalid_input", f"{name} is a model name like gemini-3.8-flash")
+            prov = understand_engine.provider(wanted)
+            if prov not in self.model_keys:
+                raise JobError("invalid_input", f"{name}: this worker has no key for {prov}")
+            if name == "describe_video" and prov != "gemini":
+                raise JobError("invalid_input", "describe_video needs a Gemini model: only Gemini watches videos")
+            out[name] = wanted
+        return out
 
     def _insert(self, tenant: str, kind: str, target: guard.Target, url: str, options: dict,
                 idem: str | None, parent: str | None = None, priority: int = 0) -> tuple[dict, bool]:
@@ -399,12 +426,14 @@ class Engine:
         parts = self._parts(target.platform, target.platform_id)
         # A transcript that exists answers the job: no download, even when the
         # file it was made from is long deleted.
-        known = bool(parts) and all(self._chosen(p["id"], opts) for p in parts)
+        # A description still wanted needs the video once more.
+        known = bool(parts) and all(self._chosen(p["id"], opts) and not self._needs_description(p["id"], opts)
+                                    for p in parts)
         if not known and (not parts or any(self._video(p["id"]) is None for p in parts)):
             parts = self._download(job, target, parts, proxy, count)
         self._set(job["id"], media_id=parts[0]["id"])
 
-        if known or all(self._chosen(p["id"], opts) for p in parts):
+        if known or all(self._chosen(p["id"], opts) and not self._needs_description(p["id"], opts) for p in parts):
             self._finish(job["id"], parts)
         else:
             # A new stage starts its own count of attempts.
@@ -423,12 +452,14 @@ class Engine:
         try:
             # Resolved and downloaded in one session: the media addresses only
             # work with the cookies their resolution got (see fetch.Session).
-            with self.fetch.session(proxy, cookiefile, self.s.max_video_mb, self.s.keep_media, count) as ses:
+            with self.fetch.session(proxy, cookiefile, self.s.max_video_mb, self.s.keep_media, count,
+                                    want_video=bool(opts.get("describe_video"))) as ses:
                 infos = self._resolve(job, target, ses)
                 parts = self._media_rows(platform, target.platform_id, target.canonical_url, infos)
                 self._set(job["id"], status="fetching")
                 for media, info in zip(parts, infos):
-                    if self._video(media["id"]) or self._chosen(media["id"], opts):
+                    if self._video(media["id"]) or (self._chosen(media["id"], opts)
+                                                    and not self._needs_description(media["id"], opts)):
                         continue
                     duration = info.get("duration") or 0
                     if duration > self.s.max_duration_s:
@@ -475,7 +506,7 @@ class Engine:
         """Whether the creator's captions will answer, so that no media needs
         downloading: _chosen's rule, read from what the extractor listed."""
         from .captions import language
-        if self.s.keep_media or opts["asr"] == "always":
+        if self.s.keep_media or opts["asr"] == "always" or opts.get("describe_video"):
             return False
         langs = {language(k) for k in info.get("subtitles") or {} if k != "live_chat"}
         return opts["language"] in langs if opts["language"] else len(langs) == 1
@@ -597,7 +628,42 @@ class Engine:
             )
             for flag in result["quality"].get("flags", []):
                 self._warn(job["id"], flag)
+        for media in parts:
+            if self._needs_description(media["id"], opts):
+                self._describe_video(job, media, opts["describe_video"])
         self._finish(job["id"], parts)
+
+    # -- understanding ----------------------------------------------------------
+
+    def _description(self, media_id: int, source: str, model: str) -> dict | None:
+        return self.db.one("select * from track where media_id = ? and source = ? and model = ?"
+                           " order by created_at desc limit 1", (media_id, source, model))
+
+    def _needs_description(self, media_id: int, opts: dict) -> bool:
+        model = opts.get("describe_video")
+        return bool(model) and not self._description(media_id, "video_description", model)
+
+    def _describe_video(self, job: dict, media: dict, model: str):
+        """What happens in the video, from the copy fetched for it. A model
+        that is busy or unreachable is asked again later; anything else is a
+        warning, and the transcript stands."""
+        video = self._video(media["id"])
+        if not video:
+            self._warn(job["id"], "video_description_skipped: no video copy to show the model")
+            return
+        path = self.s.media_dir / video["path"]
+        try:
+            text = self.understand.describe_video(model, path.read_bytes(), video["mime"] or "video/mp4",
+                                                  self.model_keys)
+        except JobError as err:
+            if err.cls == "network" and job["attempts"] < MAX_ATTEMPTS:
+                raise
+            self._warn(job["id"], f"video_description_failed: {err}"[:300])
+            return
+        self.db.run(
+            "insert into track (media_id, source, language, origin, model, params, status, segments, text, quality,"
+            " created_at) values (?, 'video_description', null, 'pictures_and_sound', ?, '{}', ?, '[]', ?, '{}', ?)",
+            (media["id"], model, "available" if text else "no_text", text, _now()))
 
     # -- pictures ---------------------------------------------------------------
 
@@ -609,9 +675,11 @@ class Engine:
         """Reads the text on a post's pictures. Each picture is deleted as
         soon as it is read; the text is what stays."""
         target = guard.parse(job["input_url"])
+        want = json.loads(job["options"]).get("describe_images")
         parts = self._parts("instagram", target.platform_id)
         read = bool(parts and self._ocr_track(parts[0]["id"]))
-        if read:
+        described = not want or bool(parts and self._description(parts[0]["id"], "vision", want))
+        if read and described:
             fresh = _now() - json.loads(parts[0]["meta"]).get("image_links_at", 0) < IMAGE_LINKS_FRESH_S
             if not job["priority"] or fresh:
                 self._set(job["id"], media_id=parts[0]["id"])
@@ -639,23 +707,42 @@ class Engine:
             " on conflict (platform, platform_id, part) do update set meta = excluded.meta",
             (target.platform_id, target.canonical_url, json.dumps(meta)))
         media = self._parts("instagram", target.platform_id)[0]
-        if read:
+        if read and described:
             self._set(job["id"], media_id=media["id"])
             return self._finish(job["id"])
         self._set(job["id"], status="fetching", media_id=media["id"])
         tmp = self.s.tmp_dir / job["id"]
         tmp.mkdir(parents=True, exist_ok=True)
-        segments = []
+        segments, descriptions = [], []
         try:
             # Pictures come from Instagram's CDN, not its API: no route budget,
             # but every one is counted.
             for i, url in enumerate(post["images"], 1):
                 path = self.fetch.download_image(url, tmp / f"{i}.jpg", proxy, count)
-                text = self.ocr(path)
+                if not read:
+                    segments.append({"image": i, "text": self.ocr(path)})
+                if not described:
+                    try:
+                        descriptions.append({"image": i, "text": self.understand.describe_image(
+                            want, path.read_bytes(), _image_mime(path), self.model_keys)})
+                    except JobError as err:
+                        if err.cls == "network" and job["attempts"] < MAX_ATTEMPTS:
+                            raise
+                        # The text read off the pictures still counts.
+                        self._warn(job["id"], f"picture_description_failed: {err}"[:300])
+                        described, descriptions = True, []
                 path.unlink(missing_ok=True)
-                segments.append({"image": i, "text": text})
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+        if descriptions:
+            self.db.run(
+                "insert into track (media_id, source, language, origin, model, params, status, segments, text,"
+                " quality, created_at) values (?, 'vision', null, 'pictures', ?, '{}', ?, ?, ?, '{}', ?)",
+                (media["id"], want, "available" if any(d["text"] for d in descriptions) else "no_text",
+                 json.dumps(descriptions), "\n\n".join(f"Slide {d['image']}:\n{d['text']}" for d in descriptions),
+                 _now()))
+        if read:
+            return self._finish(job["id"])
         read = [seg for seg in segments if seg["text"]]
         self.db.run(
             "insert into track (media_id, source, language, origin, model, params, status, segments, text, quality,"
@@ -704,7 +791,8 @@ class Engine:
         # MCP tools take up to 100): a 1000-post import must not hold up everyone else.
         waiting = job["priority"] and opts["max_items"] <= MAX_PRIORITY_ITEMS
         child_opts = {"language": opts["language"], "route": opts["route"], "asr_model": opts["asr_model"],
-                      "asr": opts["asr"], "priority": "high" if waiting else "normal"}
+                      "asr": opts["asr"], "priority": "high" if waiting else "normal",
+                      **{k: opts[k] for k in ("describe_images", "describe_video") if opts.get(k)}}
 
         def take(item, cur=None):
             """One listed post: its own job, and kept with the cursor right away."""
@@ -803,6 +891,15 @@ class Engine:
                 "model": t["model"], "model_revision": t["model_revision"], "text": t["text"],
                 "quality": json.loads(t["quality"]), "segments": json.loads(t["segments"])}
 
+    def _understanding_out(self, media: dict, opts: dict, kind: str) -> dict:
+        source, model = (("vision", opts.get("describe_images")) if kind == "images"
+                         else ("video_description", opts.get("describe_video")))
+        found = self._description(media["id"], source, model) if model else None
+        if not found:
+            return {}
+        return {"understanding": {"source": source, "model": model, "status": found["status"], "text": found["text"],
+                                  "segments": json.loads(found["segments"])}}
+
     def _part_out(self, media: dict, opts: dict, kind: str = "video") -> dict:
         arts = self.db.all("select id, kind, mime, size, sha256, language from artifact where media_id = ?"
                            " order by created_at", (media["id"],))
@@ -817,6 +914,7 @@ class Engine:
                            "sha256": a["sha256"], **({"language": a["language"]} if a["language"] else {})}
                           for a in arts],
             "transcript": self._track_out(chosen) if chosen else {"status": "missing"},
+            **self._understanding_out(media, opts, kind),
             # Every track there is, without its text: the chosen one is above.
             "tracks": [{"source": t["source"], "language": t["language"], "origin": t["origin"],
                         "status": t["status"], "model": t["model"], "characters": len(t["text"])} for t in tracks],
