@@ -25,7 +25,7 @@ import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import VERSION
-from .config import Key
+from .config import PLATFORMS, Key
 from .engine import Engine
 from .errors import JobError
 from .guard import InputError
@@ -108,8 +108,8 @@ def make_handler(engine: Engine):
                         return self._error(403, "forbidden", "unblocking a route needs an admin key")
                     body = self._body()
                     platform, route = body.get("platform"), body.get("route")
-                    if platform not in ("tiktok", "instagram") or route not in engine.s.routes:
-                        raise JobError("invalid_input", "platform is tiktok or instagram; route one of "
+                    if platform not in PLATFORMS or route not in engine.s.routes:
+                        raise JobError("invalid_input", f"platform is one of {', '.join(PLATFORMS)}; route one of "
                                                         + ", ".join(engine.s.routes))
                     return self._send(200, {"requeued_jobs": engine.unblock(platform, route)})
                 m = re.fullmatch(r"/v1/jobs/(job_[0-9a-f]{24})(/result|/cancel)?", path)

@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-PLATFORMS = ("tiktok", "instagram")
+PLATFORMS = ("tiktok", "instagram", "vimeo")
 
 
 def _int(name: str, default: int) -> int:
@@ -113,6 +113,7 @@ def load() -> Settings:
         gap_seconds={
             "tiktok": _float("SMT_GAP_TIKTOK", 2.0),
             "instagram": _float("SMT_GAP_INSTAGRAM", 5.0),
+            "vimeo": _float("SMT_GAP_VIMEO", 2.0),
         },
         fetch_workers=_int("SMT_FETCH_WORKERS", 2),
         asr_workers=_int("SMT_ASR_WORKERS", 1),

@@ -5,6 +5,10 @@ An MCP server for transcripts of social media videos:
 - **YouTube** — one video, a whole playlist, or the top results of a YouTube search.
 - **TikTok and Instagram** — one video or reel, or the newest videos of an account. The
   video is downloaded and kept, and its speech is transcribed on your machine with Whisper.
+- **Vimeo** — one video. Its own captions when they answer (then nothing is downloaded),
+  otherwise its audio, transcribed with Whisper.
+- **Instagram pictures** — the pictures of a picture post or carousel, the text on each
+  (OCR) and the caption.
 
 It runs **on your machine**. No API key, no account, no server, no token. A single YouTube
 video goes straight to YouTube. Anything bigger — a playlist, a search, a hundred videos —
@@ -178,17 +182,31 @@ more of the requested videos are left, the answer has `nextOffset`; the next cal
 as `offset` and carries on. Point such a server at a WARP proxy you run next to it with
 `YOUTUBE_TRANSCRIPT_PROXY=http://warp:1080` (the `caomingjun/warp` image serves HTTP on
 port 1080); it then uses that proxy for everything and never tries to start Docker itself.
-Such a server offers `get_social_transcript` only when it is given a worker to use
-(`SMTRANSCRIPT_WORKER_URL`, see below).
+Such a server offers `get_social_transcript` and `get_instagram_images` only when it is given
+a worker to use (`SMTRANSCRIPT_WORKER_URL`, see below). Inline, `get_instagram_images` attaches
+the pictures themselves to the answer as MCP image content (up to 10), so a model can look at them.
 
-## TikTok and Instagram
+## TikTok, Instagram and Vimeo
 
-`get_social_transcript` takes a TikTok or Instagram link:
+`get_social_transcript` takes a TikTok, Instagram or Vimeo link:
 
 | Link                                                                                   | Returns                                                           |
 | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | a video: `tiktok.com/@user/video/…`, `vm.tiktok.com/…`, `instagram.com/reel/…`, `/p/…` | that video's transcript, in the answer                            |
+| a Vimeo video: `vimeo.com/…`, `vimeo.com/<id>/<hash>`, `player.vimeo.com/video/…`      | that video's transcript, in the answer                            |
 | an account: `tiktok.com/@user`, `instagram.com/user/`                                  | the newest `max_videos` (default 10, up to 100): files + an index |
+
+`get_instagram_images` takes an Instagram post link (`instagram.com/p/…`) and returns each
+picture's link, the text read off it (Tesseract, German and English) and the caption; the
+pictures themselves are attached (inline) or saved to `save_to`. Picture links are Instagram's
+signed CDN addresses and stop working after a few days. `get_social_transcript` hands a picture
+post over to it by itself.
+
+**Vimeo** is reached through its player address, which works without a login (vimeo.com pages
+need one in yt-dlp 2026.10.26). Captions in the language asked for — or the only track — answer
+without downloading anything. Copy-protected (DRM) videos still give their captions: the error
+names the languages to ask for. Videos that may only play embedded on their owner's site
+answer `private`.
 
 Optional: `since` (accounts: `"2026-10-01"`), `language` (prefer the platform's captions in it),
 `route` (`"direct"` or `"warp"`), `asr` (`"always"` transcribes even when there are captions),
@@ -266,6 +284,8 @@ into the volume. After that a reel takes seconds.
   them too, each with its kind (`reel`, `image`, `carousel`) and caption, and reads the text on
   every picture with Tesseract (German and English); each picture is deleted as soon as it is
   read. Measured: an 8-slide carousel, 2,671 characters, 9 requests (the post and its pictures).
+- **Somebody waiting goes first:** a job with `"priority": "high"` (the MCP tools send it) is
+  claimed before bulk work on the same worker, and its video is fetched at once.
 - Private videos, and videos that need an account, are reported as such. Logged-in sessions are
   optional (`SMT_COOKIES_DIR` with `tiktok.txt` / `instagram.txt` cookie files, or an Instaloader
   session file) and stay inside the worker.
@@ -283,7 +303,7 @@ docker run -d -p 127.0.0.1:47821:8765 -e SMT_API_KEYS=me:<a long random key> \
 
 | Route                                                                          |                                                                         |
 | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
-| `POST /v1/jobs` `{url, language?, route?, asr?, asr_model?, idempotency_key?}` | a video → `202 {job_id}` (the same request again: the same job); with `"kind": "images"` the text on an Instagram picture post |
+| `POST /v1/jobs` `{url, language?, route?, asr?, asr_model?, priority?, idempotency_key?}` | a video → `202 {job_id}` (the same request again: the same job); with `"kind": "images"` the text on an Instagram picture post |
 | `POST /v1/profile-imports` `{url, max_items, since?, until?, include_images?, …}`               | an account → `202 {job_id}`; its result lists every post with its `kind` and job |
 | `GET /v1/jobs/{id}`                                                            | status, error class, `retry_after_s`                                    |
 | `GET /v1/jobs/{id}/result`                                                     | the result (`schema_version` 1.0), or `202` while it is not done        |
@@ -296,7 +316,9 @@ Every call but the health checks needs `Authorization: Bearer <key>`; another ca
 files answer 404. Settings are environment variables (`SMT_WARP_PROXY`, `SMT_ROUTE_TIKTOK`,
 `SMT_ASR_MODEL`, `SMT_ASR_DEVICE`, `SMT_MAX_VIDEO_MB`, … — all in
 [`worker/smt/config.py`](worker/smt/config.py)). An MCP server pointed at it with
-`SMTRANSCRIPT_WORKER_URL` and `SMTRANSCRIPT_WORKER_KEY` starts nothing locally.
+`SMTRANSCRIPT_WORKER_URL` and `SMTRANSCRIPT_WORKER_KEY` starts nothing locally; a worker behind
+Cloudflare Access also gets `SMTRANSCRIPT_ACCESS_CLIENT_ID` and `SMTRANSCRIPT_ACCESS_CLIENT_SECRET`
+(a service token), sent as `CF-Access-Client-Id` / `CF-Access-Client-Secret`.
 
 ## Cloudflare WARP
 

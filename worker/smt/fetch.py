@@ -22,7 +22,7 @@ from .errors import JobError, classify
 
 # Lower-cased extractor names, matched as regular expressions. Anything else
 # — above all yt-dlp's generic extractor, which fetches any page — is off.
-EXTRACTORS = ["tiktok", r"vm\.tiktok", "tiktok:user", "instagram"]
+EXTRACTORS = ["tiktok", r"vm\.tiktok", "tiktok:user", "instagram", "vimeo"]
 
 VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3"}
 CAPTION_EXT = {".vtt": "text/vtt", ".srt": "application/x-subrip", ".json": "application/json"}
@@ -149,14 +149,20 @@ class Session:
             raise JobError("unavailable", f"{url} has no video in it")
         return videos
 
-    def download(self, info: dict, tmp: Path) -> dict:
+    def download(self, info: dict, tmp: Path, captions_only: bool = False) -> dict:
         """Downloads the video (or its audio) and the captions of an entry
-        this session resolved, without asking for the page again."""
-        self._ydl.params["outtmpl"]["default"] = str(tmp / "media.%(ext)s")
+        this session resolved, without asking for the page again. With
+        captions_only, the creator's captions alone: no media at all."""
+        params = self._ydl.params
+        params["outtmpl"]["default"] = str(tmp / "media.%(ext)s")
+        params["skip_download"] = captions_only
+        params["writeautomaticsub"] = not captions_only
         try:
             self._ydl.process_ie_result(copy.deepcopy(info), download=True)
         except Exception as exc:  # noqa: BLE001
             raise classify(exc) from exc
+        finally:
+            params["skip_download"], params["writeautomaticsub"] = False, True
         video = None
         tracks = []
         for f in sorted(tmp.iterdir()):
@@ -165,6 +171,8 @@ class Session:
             elif f.suffix in CAPTION_EXT and f.name.startswith("media."):
                 # media.<language>.<ext>
                 tracks.append({"language_raw": f.name.split(".")[1], "ext": f.suffix[1:], "path": f})
+        if captions_only:
+            return {"video": None, "captions": tracks}
         if video is None:
             # yt-dlp skips a file over max_filesize without raising.
             raise JobError("too_large", f"no video file arrived (over {self._ydl.params['max_filesize'] // 2**20} MB, "

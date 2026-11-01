@@ -22,6 +22,7 @@ import random
 import threading
 import time
 
+from .config import PLATFORMS
 from .db import Db
 from .errors import JobError
 
@@ -106,7 +107,7 @@ class Routes:
         because they come from other callers' jobs."""
         rows = {r["key"]: r for r in self.db.all("select * from route_state")}
         out = []
-        for platform in ("tiktok", "instagram"):
+        for platform in PLATFORMS:
             for route in self.routes:
                 state = rows.get(f"{platform}:{route}") or self._state(f"{platform}:{route}")
                 wait = max(0, state["cooldown_until"] - time.time())

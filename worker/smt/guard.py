@@ -1,4 +1,4 @@
-"""What may come in: links to TikTok and Instagram, nothing else.
+"""What may come in: links to TikTok, Instagram and Vimeo, nothing else.
 
 A job service that fetches whatever URL it is handed is a way into the network
 it runs in. So the input is matched against the two platforms' own hosts, a
@@ -20,7 +20,8 @@ from urllib.parse import urljoin, urlparse
 
 TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}
 INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "m.instagram.com", "instagr.am", "www.instagr.am"}
-HOSTS = TIKTOK_HOSTS | INSTAGRAM_HOSTS
+VIMEO_HOSTS = {"vimeo.com", "www.vimeo.com", "player.vimeo.com"}
+HOSTS = TIKTOK_HOSTS | INSTAGRAM_HOSTS | VIMEO_HOSTS
 
 # Instagram paths that are not account names.
 _IG_RESERVED = {"p", "reel", "reels", "tv", "stories", "explore", "accounts", "share", "direct", "about", "legal"}
@@ -32,10 +33,11 @@ class InputError(ValueError):
 
 @dataclass(frozen=True)
 class Target:
-    platform: str  # tiktok | instagram
+    platform: str  # tiktok | instagram | vimeo
     kind: str  # video | profile | short
     platform_id: str | None  # video id / shortcode, or the account name for a profile
     canonical_url: str
+    fetch_url: str | None = None  # where the extractor is pointed, when not the canonical address
 
 
 def _clean(url: str) -> tuple[str, str]:
@@ -45,13 +47,32 @@ def _clean(url: str) -> tuple[str, str]:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if host not in HOSTS:
-        raise InputError(f"not a TikTok or Instagram link: {host or url!r}")
+        raise InputError(f"not a TikTok, Instagram or Vimeo link: {host or url!r}")
     return host, parsed.path
+
+
+def _vimeo(host: str, url: str, path: str) -> Target:
+    """Single videos only. An unlisted video's hash (vimeo.com/<id>/<hash>
+    or ?h=<hash>) is part of its address and is kept."""
+    m = (re.match(r"^/video/(\d+)/?$", path) if host == "player.vimeo.com" else None) or re.match(
+        r"^/(?:channels/[\w-]+/|groups/[\w-]+/videos/|showcase/\d+/video/)?(\d+)(?:/([0-9a-f]{6,}))?/?$", path)
+    if not m:
+        raise InputError(f"no Vimeo video in {url!r} (accounts and showcases are not taken)")
+    video_id = m.group(1)
+    hash_ = m.group(2) if m.re.groups >= 2 else None
+    query = re.search(r"[?&]h=([0-9a-f]{6,})", url)
+    hash_ = hash_ or (query.group(1) if query else None)
+    # vimeo.com pages need a login in yt-dlp 2026.10.26; the player address does
+    # not (measured 2026-11-01, logged out, from the worker image).
+    return Target("vimeo", "video", video_id, f"https://vimeo.com/{video_id}" + (f"/{hash_}" if hash_ else ""),
+                  f"https://player.vimeo.com/video/{video_id}" + (f"?h={hash_}" if hash_ else ""))
 
 
 def parse(url: str) -> Target:
     """Platform, kind and id from the link alone — no network."""
     host, path = _clean(url)
+    if host in VIMEO_HOSTS:
+        return _vimeo(host, url, path)
     if host in TIKTOK_HOSTS:
         if host in ("vm.tiktok.com", "vt.tiktok.com") or path.startswith("/t/"):
             return Target("tiktok", "short", None, f"https://{host}{path}")

@@ -1,3 +1,3 @@
-"""SMTranscript worker: TikTok and Instagram videos in, stored files and transcripts out."""
+"""SMTranscript worker: TikTok, Instagram and Vimeo videos in, stored files and transcripts out."""
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"

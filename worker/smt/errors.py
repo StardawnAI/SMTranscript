@@ -22,6 +22,7 @@ ACTIONS = {
     "unavailable": "the video is gone or never existed",
     "private": "the video is private or only for followers",
     "login_required": "the video needs a logged-in session",
+    "drm": "the video's media is copy-protected; only its captions can be read",
     "too_large": "over the size or duration limit",
     "disk_full": "stop downloading until space is free",
     "invalid_input": "not a link this service takes",
@@ -29,7 +30,8 @@ ACTIONS = {
     "internal": "a bug in this service",
 }
 
-TERMINAL = {"parser", "unavailable", "private", "login_required", "too_large", "invalid_input", "cancelled", "internal"}
+TERMINAL = {"parser", "unavailable", "private", "login_required", "drm", "too_large", "invalid_input", "cancelled",
+            "internal"}
 
 
 class JobError(Exception):
@@ -49,7 +51,8 @@ _RULES = [
     ("rate_limited", r"HTTP Error 429|Too Many Requests|rate-?limit|Please wait a few minutes"),
     ("challenge", r"TikTok is requiring login|checkpoint|challenge_required"),
     ("route_down", r"Unable to connect to proxy|ProxyError|SOCKS|Tunnel connection failed|proxy.*refused"),
-    ("private", r"[Pp]rivate|do not have permission|who follow this account"),
+    ("drm", r"DRM protected"),
+    ("private", r"[Pp]rivate|do not have permission|who follow this account|protected by a password|embed-only"),
     ("login_required", r"Restricted Video|registered users|login required|log ?in|--cookies"),
     ("unavailable", r"not available|no longer available|has been removed|deleted|HTTP Error 404|"
                     r"IP address is blocked from accessing this post|does not exist|Not Found"),

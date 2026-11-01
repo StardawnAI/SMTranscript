@@ -53,6 +53,7 @@ class FakeFetch:
         self.entries = 1
         self.duration = 2
         self.profile_items: list[dict] = []
+        self.listed_subtitles: dict = {}  # what the extractor lists, before anything is downloaded
 
     caption_segments = staticmethod(fetch.caption_segments)
 
@@ -70,8 +71,8 @@ class FakeFetch:
             def resolve(self, url):
                 return fake.resolve(url, proxy, count, cookiefile)
 
-            def download(self, info, tmp):
-                return fake.download(info, proxy, tmp, count, cookiefile, max_mb, keep_media)
+            def download(self, info, tmp, captions_only=False):
+                return fake.download(info, proxy, tmp, count, cookiefile, max_mb, keep_media, captions_only)
 
         return Session()
 
@@ -88,16 +89,18 @@ class FakeFetch:
         if self.resolve_errors:
             raise self.resolve_errors.pop(0)
         return [{"id": f"v{i}", "title": "A clip", "uploader": "someone", "duration": self.duration,
-                 "timestamp": 1761800000, "formats": [{"url": "https://cdn.example/x.mp4"}]}
+                 "timestamp": 1761800000, "formats": [{"url": "https://cdn.example/x.mp4"}],
+                 "subtitles": self.listed_subtitles}
                 for i in range(self.entries)]
 
-    def download(self, info, proxy, tmp, count, cookiefile, max_mb, keep_media=True):
-        self._call("download", proxy, count)
+    def download(self, info, proxy, tmp, count, cookiefile, max_mb, keep_media=True, captions_only=False):
+        self._call("captions" if captions_only else "download", proxy, count)
         self.kept = keep_media
         if self.download_errors:
             raise self.download_errors.pop(0)
-        video = tmp / "media.mp4"
-        shutil.copyfile(self.clip, video)
+        video = None if captions_only else tmp / "media.mp4"
+        if video:
+            shutil.copyfile(self.clip, video)
         tracks = []
         for lang, ext, data in self.captions:
             f = tmp / f"media.{lang}.{ext}"
@@ -165,7 +168,8 @@ def settings(data: Path, **over) -> config.Settings:
     base = dict(
         data=data, keys=config.parse_keys(f"alice:{'a' * 21},bob:{'b' * 20},root:{'r' * 20}:admin"),
         port=0, bind="127.0.0.1", routes={"direct": None, "warp": "http://warp:1080"},
-        default_route={"tiktok": "direct", "instagram": "direct"}, gap_seconds={"tiktok": 0, "instagram": 0},
+        default_route={"tiktok": "direct", "instagram": "direct", "vimeo": "direct"},
+        gap_seconds={"tiktok": 0, "instagram": 0, "vimeo": 0},
         fetch_workers=1, asr_workers=1, max_video_mb=50, max_duration_s=600, max_profile_items=50,
         min_free_mb=0, asr_model="large-v3-turbo", asr_device="cpu", cookies_dir=None,
         instaloader_session=None, instagram_user=None, asr_models=("small",),
@@ -188,15 +192,24 @@ class GuardTest(unittest.TestCase):
             "https://www.instagram.com/share/reel/BAd/": ("instagram", "short", None),
             "https://www.instagram.com/tagesschau/": ("instagram", "profile", "tagesschau"),
             "https://www.instagram.com/tagesschau/reels/": ("instagram", "profile", "tagesschau"),
+            "https://vimeo.com/76979871": ("vimeo", "video", "76979871"),
+            "https://vimeo.com/channels/staffpicks/76979871": ("vimeo", "video", "76979871"),
+            "https://player.vimeo.com/video/76979871?h=8272103f6e": ("vimeo", "video", "76979871"),
         }
         for url, want in cases.items():
             t = guard.parse(url)
             self.assertEqual((t.platform, t.kind, t.platform_id), want, url)
         self.assertEqual(guard.parse(IG).canonical_url, "https://www.instagram.com/p/DNoIGNAu8fy/")
+        # An unlisted Vimeo video's hash is part of its address.
+        self.assertEqual(guard.parse("https://player.vimeo.com/video/76979871?h=8272103f6e").canonical_url,
+                         "https://vimeo.com/76979871/8272103f6e")
+        self.assertEqual(guard.parse("vimeo.com/76979871/8272103f6e").canonical_url,
+                         "https://vimeo.com/76979871/8272103f6e")
 
     def test_refused(self):
         for url in ("https://youtube.com/watch?v=x", "http://169.254.169.254/latest", "https://tiktok.com.evil.io/@a",
-                    "https://www.instagram.com/explore/", "file:///etc/passwd", "https://www.tiktok.com/foryou"):
+                    "https://www.instagram.com/explore/", "file:///etc/passwd", "https://www.tiktok.com/foryou",
+                    "https://vimeo.com/someuser", "https://vimeo.com/showcase/123", "https://vimeo.com.evil.io/1"):
             with self.assertRaises(guard.InputError, msg=url):
                 guard.parse(url)
 
@@ -211,6 +224,9 @@ class ErrorsTest(unittest.TestCase):
             "ERROR: [Instagram] X: The webpage request was redirected to the login page. You have exceeded "
             "the rate-limit for accessing posts anonymously": "rate_limited",
             "ERROR: [TikTok] 1: Your IP address is blocked from accessing this post": "unavailable",
+            "ERROR: [vimeo] 76979871: This video is protected by a password, use the --video-password option": "private",
+            "ERROR: [vimeo] 1: Cannot download embed-only video without embedding URL": "private",
+            "ERROR: This format is DRM protected; Try selecting another format with --format": "drm",
             "TikTok is requiring login for access to this content": "challenge",
             "You do not have permission to view this post. Log into an account that has access": "private",
             "Restricted Video: You must be 18 years old. Use --cookies": "login_required",
@@ -545,6 +561,67 @@ class EngineTest(unittest.TestCase):
         self.drain(engine)
         self.assertEqual(self.job(c["id"])["status"], "completed")
 
+    def test_someone_waiting_goes_before_bulk_work(self):
+        engine = self.make(asr_backlog=1)
+        bulk = [engine.submit_video("alice", f"https://www.tiktok.com/@x/video/{i}")[0] for i in (1, 2, 3)]
+        engine.run_once(("fetch",))  # one file waits for Whisper: the backlog is full
+        waiting, _ = engine.submit_video("bob", "https://www.tiktok.com/@x/video/9", {"priority": "high"})
+        claimed = engine.claim(("fetch",))
+        self.assertEqual(claimed["id"], waiting["id"])  # first, and past the backlog rule
+        engine.db.run("update job set lease_until = null, attempts = 0 where id = ?", (claimed["id"],))
+        engine.run_once(("fetch",))
+        self.assertEqual(engine.claim(("asr",))["id"], waiting["id"])  # and first for Whisper
+        self.assertEqual(self.job(bulk[2]["id"])["stage"], "fetch")
+        with self.assertRaises(JobError):
+            engine.submit_video("bob", TT, {"priority": "urgent"})
+
+    def test_asking_with_priority_lifts_a_bulk_job(self):
+        bulk, _ = self.engine.submit_video("alice", TT)
+        again, existing = self.engine.submit_video("alice", TT, {"priority": "high"})
+        self.assertEqual((again["id"], existing, again["priority"]), (bulk["id"], True, 1))
+        self.assertEqual(self.engine.submit_video("alice", TT)[0]["priority"], 1)  # never lowered
+
+    def test_captions_answer_without_any_download(self):
+        engine = self.make(keep_media=False)
+        self.fake.listed_subtitles = {"en": [{"ext": "vtt"}]}
+        self.fake.captions = [("en", "vtt", "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nGood evening\n")]
+        job, _ = engine.submit_video("alice", "https://vimeo.com/76979871")
+        self.drain(engine)
+        result = engine.result(self.job(job["id"]))
+        self.assertEqual((result["status"], result["transcript"]["source"]), ("completed", "native_captions"))
+        self.assertEqual(result["transcript"]["text"], "Good evening")
+        self.assertEqual(self.fake.calls, ["resolve", "captions"])  # no media at all
+        self.assertEqual(self.asr.calls, 0)
+        # Several languages listed: nothing says which is spoken, so the audio comes.
+        self.fake.calls, self.fake.listed_subtitles = [], {"en": [], "de": []}
+        engine.submit_video("alice", "https://vimeo.com/2")
+        self.drain(engine)
+        self.assertEqual(self.fake.calls, ["resolve", "download"])
+
+    def test_copy_protected_audio_points_to_the_captions(self):
+        engine = self.make(keep_media=False)
+        self.fake.listed_subtitles = {"de": [], "en": []}  # two languages: the audio would be needed
+        self.fake.download_errors = [classify(Exception("ERROR: This format is DRM protected; Try selecting another"))]
+        job, _ = engine.submit_video("alice", "https://vimeo.com/76979871")
+        self.drain(engine)
+        row = self.job(job["id"])
+        self.assertEqual((row["status"], row["error_class"]), ("failed", "drm"))
+        self.assertIn("captions in de, en", row["error"])
+        again, _ = engine.submit_video("alice", "https://vimeo.com/76979871", {"language": "de"})
+        self.fake.captions = [("de", "vtt", "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nHier bei Vimeo\n")]
+        self.drain(engine)
+        self.assertEqual(engine.result(self.job(again["id"]))["transcript"]["text"], "Hier bei Vimeo")
+
+    def test_captions_that_say_nothing_fall_back_to_the_audio(self):
+        engine = self.make(keep_media=False)
+        self.fake.listed_subtitles = {"en": [{"ext": "vtt"}]}
+        self.fake.captions = [("en", "vtt", "WEBVTT\n\n")]  # listed, but empty
+        job, _ = engine.submit_video("alice", "https://vimeo.com/3")
+        self.drain(engine)
+        result = engine.result(self.job(job["id"]))
+        self.assertEqual(self.fake.calls, ["resolve", "captions", "download"])
+        self.assertEqual((result["status"], result["transcript"]["source"]), ("completed", "asr"))
+
     def test_cancel(self):
         job, _ = self.engine.submit_video("alice", TT)
         self.engine.cancel(self.job(job["id"]))
@@ -616,6 +693,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(result["transcript"]["text"], "Tipp 1: Nießbrauch prüfen")
         self.assertEqual([s["image"] for s in result["transcript"]["segments"]], [1, 2])
         self.assertEqual((result["media"]["post_kind"], result["media"]["videos_not_read"]), ("carousel", 1))
+        self.assertEqual(len(result["media"]["image_urls"]), 2)  # where the pictures are, for a caller to show
         self.assertTrue(all(not f.exists() for f in self.fake.downloaded))  # every picture deleted
         self.assertEqual(self.job(job["id"])["platform_requests"], 3)  # the post + two pictures
         again, _ = self.engine.submit_images("bob", "https://www.instagram.com/p/CAROUSEL1/")

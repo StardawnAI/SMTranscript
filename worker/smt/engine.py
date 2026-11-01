@@ -55,6 +55,14 @@ def _iso(ts: float | None) -> str | None:
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat().replace("+00:00", "Z") if ts else None
 
 
+def _priority(options: dict | None) -> int:
+    """"high": a caller is waiting for this one job, so it goes before bulk work."""
+    value = (options or {}).get("priority") or "normal"
+    if value not in ("normal", "high"):
+        raise JobError("invalid_input", 'priority is "normal" or "high"')
+    return 1 if value == "high" else 0
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -115,7 +123,7 @@ class Engine:
         return {"language": language.lower() if language else None, "route": route, "asr_model": model, "asr": asr}
 
     def _insert(self, tenant: str, kind: str, target: guard.Target, url: str, options: dict,
-                idem: str | None, parent: str | None = None) -> tuple[dict, bool]:
+                idem: str | None, parent: str | None = None, priority: int = 0) -> tuple[dict, bool]:
         route = options["route"] or self.s.default_route[target.platform]
         key = idem or hashlib.sha256(json.dumps(
             {"kind": kind, "url": target.canonical_url, **options}, sort_keys=True).encode()).hexdigest()
@@ -131,16 +139,20 @@ class Engine:
             self.db.audit("retry", tenant, existing["id"])
             existing = self.db.one("select * from job where id = ?", (existing["id"],))
         if existing:
+            if priority > existing["priority"]:
+                # Someone now waits for a job that was queued in bulk.
+                self.db.run("update job set priority = ? where id = ?", (priority, existing["id"]))
+                existing = self.db.one("select * from job where id = ?", (existing["id"],))
             return existing, True
         job_id = "job_" + secrets.token_hex(12)
         now = _now()
         self.db.run(
             "insert into job (id, tenant, kind, idem_key, input_url, platform, platform_id, canonical_url, options,"
-            " status, stage, route, parent_id, created_at, updated_at)"
-            " values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?) on conflict (tenant, idem_key) do nothing",
+            " status, stage, route, parent_id, priority, created_at, updated_at)"
+            " values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?) on conflict (tenant, idem_key) do nothing",
             (job_id, tenant, kind, key, url, target.platform, target.platform_id if kind != "profile" else None,
              target.canonical_url, json.dumps(options), "profile" if kind == "profile" else "fetch",
-             route, parent, now, now),
+             route, parent, priority, now, now),
         )
         job = self.db.one("select * from job where tenant = ? and idem_key = ?", (tenant, key))
         created = job["id"] == job_id
@@ -153,7 +165,8 @@ class Engine:
         target = guard.parse(url)
         if target.kind == "profile":
             raise JobError("invalid_input", "this is an account, not a video — use a profile import")
-        return self._insert(tenant, "video", target, url, self._options(options or {}), idem, parent)
+        return self._insert(tenant, "video", target, url, self._options(options or {}), idem, parent,
+                            _priority(options))
 
     def submit_images(self, tenant: str, url: str, options: dict | None = None, idem: str | None = None,
                       parent: str | None = None) -> tuple[dict, bool]:
@@ -161,7 +174,8 @@ class Engine:
         target = guard.parse(url)
         if target.platform != "instagram" or target.kind != "video":
             raise JobError("invalid_input", "pictures are read from Instagram post links (instagram.com/p/...)")
-        return self._insert(tenant, "images", target, url, self._options(options or {}), idem, parent)
+        return self._insert(tenant, "images", target, url, self._options(options or {}), idem, parent,
+                            _priority(options))
 
     def submit_profile(self, tenant: str, url: str, options: dict | None = None,
                        idem: str | None = None) -> tuple[dict, bool]:
@@ -182,7 +196,7 @@ class Engine:
                     raise JobError("invalid_input", f"{key} is a date like 2026-10-01") from exc
         opts.update(max_items=limit, since=options.get("since"), until=options.get("until"),
                     include_images=bool(options.get("include_images")) and target.platform == "instagram")
-        return self._insert(tenant, "profile", target, url, opts, idem)
+        return self._insert(tenant, "profile", target, url, opts, idem, priority=_priority(options))
 
     def cancel(self, job: dict) -> dict:
         if job["status"] not in TERMINAL:
@@ -216,14 +230,16 @@ class Engine:
         # than asr_backlog files already waiting for transcription, video
         # fetches wait. So downloaded audio is never stockpiled on disk, and
         # an account's requests to the platform spread out over the run.
+        # A job someone waits for (priority 1, an MCP call) goes first and its
+        # video is fetched at once: it is one file, not an account's worth.
         job = self.db.one(
             f"update job set lease_owner = ?, lease_until = ?, attempts = attempts + 1, updated_at = ? "
             f"where id = (select id from job where stage in ({marks}) and next_at <= ? "
             f" and status in ('queued','resolving','fetching','processing','retry_wait') "
             f" and (lease_until is null or lease_until < ?) "
-            f" and (stage != 'fetch' or kind != 'video' "
+            f" and (stage != 'fetch' or kind != 'video' or priority > 0 "
             f"      or (select count(*) from job w where w.stage = 'asr') < ?) "
-            f" order by created_at limit 1) "
+            f" order by priority desc, created_at limit 1) "
             f"returning *",
             (self.name, now + LEASE_S, now, *stages, now, now, self.s.asr_backlog),
         )
@@ -395,6 +411,7 @@ class Engine:
         if free_mb < self.s.min_free_mb:
             raise JobError("disk_full", f"only {free_mb} MB free, {self.s.min_free_mb} MB kept in reserve")
         platform, route = target.platform, job["route"]
+        opts = json.loads(job["options"])
         tmp_root = self.s.tmp_dir / job["id"]
         cookie_dir = tmp_root / "session"
         cookie_dir.mkdir(parents=True, exist_ok=True)
@@ -407,7 +424,7 @@ class Engine:
                 parts = self._media_rows(platform, target.platform_id, target.canonical_url, infos)
                 self._set(job["id"], status="fetching")
                 for media, info in zip(parts, infos):
-                    if self._video(media["id"]):
+                    if self._video(media["id"]) or self._chosen(media["id"], opts):
                         continue
                     duration = info.get("duration") or 0
                     if duration > self.s.max_duration_s:
@@ -415,6 +432,13 @@ class Engine:
                     tmp = tmp_root / f"part{media['part']}"
                     shutil.rmtree(tmp, ignore_errors=True)
                     tmp.mkdir(parents=True)
+                    if self._captions_first(info, opts):
+                        got = self._download_one(platform, route, info, tmp, ses, captions_only=True)
+                        for track in got["captions"]:
+                            self._store_captions(media, track)
+                        if self._chosen(media["id"], opts):
+                            continue
+                        # The captions did not settle it after all: the audio, for Whisper.
                     got = self._download_one(platform, route, info, tmp, ses)
                     probe = _probe_streams(got["video"])
                     # What the post is, not what was downloaded: without keep_media
@@ -436,19 +460,33 @@ class Engine:
         self._set(job["id"], status="resolving")
         with self.routes.request(target.platform, job["route"]):
             try:
-                infos = ses.resolve(target.canonical_url)
+                infos = ses.resolve(target.fetch_url or target.canonical_url)
             except JobError as err:
                 self.routes.record(target.platform, job["route"], err)
                 raise
             self.routes.record(target.platform, job["route"], None)
         return infos
 
-    def _download_one(self, platform, route, info, tmp, ses) -> dict:
+    def _captions_first(self, info: dict, opts: dict) -> bool:
+        """Whether the creator's captions will answer, so that no media needs
+        downloading: _chosen's rule, read from what the extractor listed."""
+        from .captions import language
+        if self.s.keep_media or opts["asr"] == "always":
+            return False
+        langs = {language(k) for k in info.get("subtitles") or {} if k != "live_chat"}
+        return opts["language"] in langs if opts["language"] else len(langs) == 1
+
+    def _download_one(self, platform, route, info, tmp, ses, captions_only=False) -> dict:
         with self.routes.request(platform, route):
             try:
-                got = ses.download(info, tmp)
+                got = ses.download(info, tmp, captions_only)
             except JobError as err:
                 self.routes.record(platform, route, err)
+                langs = sorted(k for k in info.get("subtitles") or {} if k != "live_chat")
+                if err.cls == "drm" and langs:
+                    # Copy-protected media can still have readable captions (Vimeo).
+                    raise JobError("drm", "the audio is copy-protected (DRM), but the video has captions in "
+                                          f"{', '.join(langs)}: ask again with language set to one of them") from err
                 raise
             self.routes.record(platform, route, None)
         return got
@@ -585,6 +623,8 @@ class Engine:
         meta = {"title": None, "description": post["caption"], "author": post["author"],
                 "published_at": _iso(post["taken_at"].timestamp()) if post.get("taken_at") else None,
                 "post_kind": post["kind"], "images": len(post["images"]), "videos_not_read": post["videos"],
+                # Instagram's signed CDN addresses: they expire after some days.
+                "image_urls": post["images"],
                 "has_video": False}
         self.db.run(
             "insert into media (platform, platform_id, part, canonical_url, meta) values ('instagram', ?, 0, ?, ?)"
@@ -650,7 +690,7 @@ class Engine:
 
         seen = {i["id"] for i in items}
         child_opts = {"language": opts["language"], "route": opts["route"], "asr_model": opts["asr_model"],
-                      "asr": opts["asr"]}
+                      "asr": opts["asr"], "priority": "high" if job["priority"] else "normal"}
 
         def take(item, cur=None):
             """One listed post: its own job, and kept with the cursor right away."""

@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
-import { client, fileName, parseSocialLink, runSocialTool, shape } from '../src/social.mjs';
+import { IMAGE_BLOCKS, client, fetchImages, fileName, parseSocialLink, runImagesTool, runSocialTool, shape } from '../src/social.mjs';
 import { tools } from '../src/mcp-server.mjs';
 
 const TT = 'https://www.tiktok.com/@tagesschau/video/7702581353048624387';
@@ -39,7 +39,7 @@ function fakeApi({ results = {}, pending = 1, profile } = {}) {
 
 const deps = (api, extra = {}) => ({ worker: { url: 'x', key: 'k' }, api, pollMs: 0, ...extra });
 
-test('links: videos, short links and accounts on both platforms, nothing else', () => {
+test('links: videos, short links and accounts on the three platforms, nothing else', () => {
   const cases = {
     [TT]: 'tiktok/video',
     'https://vm.tiktok.com/ZMabc/': 'tiktok/video',
@@ -50,6 +50,10 @@ test('links: videos, short links and accounts on both platforms, nothing else', 
     'https://www.instagram.com/explore/': null,
     'https://www.youtube.com/watch?v=x': null,
     'https://tiktok.com.evil.io/@a': null,
+    'https://vimeo.com/76979871': 'vimeo/video',
+    'https://player.vimeo.com/video/76979871?h=8272103f6e': 'vimeo/video',
+    'https://vimeo.com/someuser': null,
+    'https://vimeo.com.evil.io/1': null,
   };
   for (const [url, want] of Object.entries(cases)) {
     const got = parseSocialLink(url);
@@ -64,7 +68,8 @@ test('a video waits for the worker and answers like the YouTube tool', async () 
   assert.deepEqual(out.segments, [{ text: 'Hallo zusammen', start: '00:00:01.200', end: '00:00:03.360', startMs: 1200, endMs: 3360 }]);
   assert.equal(out.source, 'asr');
   assert.equal(out.video.artifactId, 'art_1');
-  assert.deepEqual(api.calls[0], ['submit', { url: TT, route: 'direct', language: 'de' }]);
+  // priority high: a caller waits, so a bulk import on the same worker does not hold it up
+  assert.deepEqual(api.calls[0], ['submit', { url: TT, route: 'direct', priority: 'high', language: 'de' }]);
 });
 
 test('music comes back empty with a note, not as an error', () => {
@@ -115,7 +120,7 @@ test('a profile writes one file per video and answers with an index', async () =
     assert.equal((await readFile(join(dir, 'tiktok_1.txt'), 'utf8')).trim(), 'erster');
     assert.equal(out.videos[0].characters, 6);
     assert.equal(out.videos[0].fullText, undefined);
-    assert.deepEqual(api.calls[0], ['profile', { url: 'https://www.tiktok.com/@a', max_items: 3, route: 'direct' }]);
+    assert.deepEqual(api.calls[0], ['profile', { url: 'https://www.tiktok.com/@a', max_items: 3, route: 'direct', priority: 'high' }]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -154,9 +159,10 @@ test('a server elsewhere offers the social tool only with a worker to use', () =
   try {
     process.env.YOUTUBE_TRANSCRIPT_OUTPUT = 'inline';
     assert.deepEqual(tools({}).map((t) => t.tool.name), ['get_youtube_transcript']);
-    assert.deepEqual(tools({ SMTRANSCRIPT_WORKER_URL: 'http://w' }).map((t) => t.tool.name), ['get_youtube_transcript', 'get_social_transcript']);
+    assert.deepEqual(tools({ SMTRANSCRIPT_WORKER_URL: 'http://w' }).map((t) => t.tool.name),
+      ['get_youtube_transcript', 'get_social_transcript', 'get_instagram_images']);
     delete process.env.YOUTUBE_TRANSCRIPT_OUTPUT;
-    assert.equal(tools({}).length, 2);
+    assert.equal(tools({}).length, 3);
   } finally {
     if (saved === undefined) delete process.env.YOUTUBE_TRANSCRIPT_OUTPUT;
     else process.env.YOUTUBE_TRANSCRIPT_OUTPUT = saved;
@@ -165,8 +171,10 @@ test('a server elsewhere offers the social tool only with a worker to use', () =
 
 test('the HTTP client sends the key and keeps 202 apart from 200', async () => {
   const auth = [];
+  const access = [];
   const server = createServer((req, res) => {
     auth.push(req.headers.authorization);
+    access.push(`${req.headers['cf-access-client-id']}|${req.headers['cf-access-client-secret']}`);
     if (req.url === '/v1/jobs/job_a/result') {
       res.writeHead(202, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ status: 'fetching' }));
@@ -181,14 +189,86 @@ test('the HTTP client sends the key and keeps 202 apart from 200', async () => {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const dir = await mkdtemp(join(tmpdir(), 'smt-'));
   try {
-    const api = client({ url: `http://127.0.0.1:${server.address().port}`, key: 'secret' });
+    const headers = { 'CF-Access-Client-Id': 'id.access', 'CF-Access-Client-Secret': 'cf-secret' };
+    const api = client({ url: `http://127.0.0.1:${server.address().port}`, key: 'secret', headers });
     assert.deepEqual(await api.result('job_a'), { status: 202, data: { status: 'fetching' } });
     await assert.rejects(api.submit({ url: 'x' }), /not a TikTok or Instagram link/);
     const file = await api.download('art_1', join(dir, 'v.mp4'));
     assert.equal(await readFile(file, 'utf8'), 'mp4');
     assert.ok(auth.every((a) => a === 'Bearer secret'));
+    assert.ok(access.every((a) => a === 'id.access|cf-secret'), access.join(' '));  // Cloudflare Access in front of a remote worker
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+function pictures(id, extra = {}) {
+  return {
+    job_id: id, kind: 'images', status: 'completed', platform_requests: 3,
+    media: { platform: 'instagram', platform_id: 'DfAtyePiCIS', canonical_url: 'https://www.instagram.com/p/DfAtyePiCIS/', post_kind: 'carousel',
+      author: 'immo.dommi', description: 'Drei Tipps', images: 2, videos_not_read: 0,
+      image_urls: ['https://scontent-fra5-1.cdninstagram.com/v/1.jpg?oe=1', 'https://scontent-fra5-1.cdninstagram.com/v/2.jpg?oe=1'] },
+    transcript: { status: 'available', source: 'ocr', text: 'Tipp 1', segments: [{ image: 1, text: 'Tipp 1' }, { image: 2, text: '' }] },
+    ...extra,
+  };
+}
+
+const fakeImages = async (images) => images.map((i) => (i.index === 2 ? { index: 2, error: 'HTTP 403 (the link has expired: ask again for a fresh one)' } : { index: i.index, bytes: Buffer.from('jpeg'), mimeType: 'image/jpeg' }));
+
+test('a picture post: each picture with its link and text, and the pictures attached inline', async () => {
+  const api = fakeApi({ results: { job_v: pictures('job_v') } });
+  const out = await runImagesTool({ url: 'https://www.instagram.com/p/DfAtyePiCIS/' }, {}, deps(api, { output: 'inline', fetchImages: fakeImages }));
+  assert.deepEqual(api.calls[0], ['submit', { url: 'https://www.instagram.com/p/DfAtyePiCIS/', kind: 'images', route: 'direct', priority: 'high' }]);
+  assert.equal(out.caption, 'Drei Tipps');
+  assert.deepEqual(out.images.map((i) => [i.index, i.text]), [[1, 'Tipp 1'], [2, '']]);
+  assert.match(out.images[1].error, /expired/);
+  assert.deepEqual(out[IMAGE_BLOCKS], [{ type: 'image', data: Buffer.from('jpeg').toString('base64'), mimeType: 'image/jpeg' }]);
+  assert.ok(!JSON.stringify(out).includes(Buffer.from('jpeg').toString('base64')), 'the picture is not repeated in the JSON text');
+  await assert.rejects(runImagesTool({ url: TT }, {}, deps(api)), /not an Instagram post link/);
+});
+
+test('a picture post on this machine: the pictures become files in save_to', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'smt-'));
+  try {
+    const api = fakeApi({ results: { job_v: pictures('job_v') } });
+    const out = await runImagesTool({ url: 'https://www.instagram.com/p/DfAtyePiCIS/', save_to: dir }, {}, deps(api, { output: 'files', fetchImages: fakeImages }));
+    assert.deepEqual(await readdir(dir), ['instagram_DfAtyePiCIS_1.jpg']);
+    assert.equal(out.images[0].savedTo, join(dir, 'instagram_DfAtyePiCIS_1.jpg'));
+    assert.equal(out[IMAGE_BLOCKS], undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the transcript tool hands a picture post over to the pictures', async () => {
+  const noVideo = { ...result('job_v', ''), status: 'failed', error: { class: 'unavailable', message: 'https://www.instagram.com/p/DfAtyePiCIS/ has no video in it' } };
+  let n = 0;
+  const api = fakeApi({ results: { job_v: noVideo } });
+  api.result = async () => (n++ === 0 ? { status: 200, data: noVideo } : { status: 200, data: pictures('job_v') });
+  const out = await runSocialTool({ url: 'https://www.instagram.com/p/DfAtyePiCIS/' }, {}, deps(api, { output: 'inline', fetchImages: fakeImages }));
+  assert.match(out.note, /A picture post/);
+  assert.equal(out.textFromImages, 'Tipp 1');
+  assert.equal(api.calls[1][1].kind, 'images');
+});
+
+test('pictures are fetched only from Instagram\'s CDN hosts', async () => {
+  const asked = [];
+  const fake = async (url) => { asked.push(url); return new Response('jpeg', { headers: { 'Content-Type': 'image/jpeg' } }); };
+  const got = await fetchImages([
+    { index: 1, url: 'https://scontent.cdninstagram.com/a.jpg' },
+    { index: 2, url: 'http://169.254.169.254/latest/meta-data' },
+    { index: 3, url: 'https://cdninstagram.com.evil.io/x.jpg' },
+  ], fake);
+  assert.deepEqual(asked, ['https://scontent.cdninstagram.com/a.jpg']);
+  assert.equal(got[0].mimeType, 'image/jpeg');
+  assert.match(got[1].error, /not an Instagram picture host/);
+  assert.match(got[2].error, /not an Instagram picture host/);
+});
+
+test('Vimeo: single videos, not accounts', async () => {
+  const api = fakeApi({ results: { job_v: { ...result('job_v', 'Hier bei Vimeo'), media: { platform: 'vimeo', platform_id: '76979871', canonical_url: 'https://vimeo.com/76979871' } } } });
+  const out = await runSocialTool({ url: 'https://player.vimeo.com/video/76979871', language: 'de' }, {}, deps(api));
+  assert.equal((out.platform, out.fullText), 'Hier bei Vimeo');
+  await assert.rejects(runSocialTool({ url: 'https://vimeo.com/76979871', url_type: 'profile' }, {}, deps(api)), /single videos only/);
 });

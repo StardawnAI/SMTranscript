@@ -6,9 +6,9 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { BlockedError, getTranscript, getTranscripts, parsePlaylistId, parseVideoId, playlistVideoIds, searchVideoIds } from './youtube.mjs';
 import { configuredProxy, readConfig } from './config.mjs';
 import { dockerAvailable, rotate as rotateWarp, start as startWarp } from './warp.mjs';
-import { runSocialTool, socialTool } from './social.mjs';
+import { IMAGE_BLOCKS, imagesTool, runImagesTool, runSocialTool, socialTool } from './social.mjs';
 
-export const VERSION = '3.1.0';
+export const VERSION = '3.2.0';
 const PROTOCOL = '2025-06-18';
 const DELAY_MS = Number(process.env.YOUTUBE_TRANSCRIPT_DELAY_MS || 1000);
 const CONCURRENCY = Number(process.env.YOUTUBE_TRANSCRIPT_CONCURRENCY || 3);
@@ -260,13 +260,14 @@ export async function runTool(args, { notify = () => {} } = {}, deps = {}) {
   }, { bulk: true, notify }, deps);
 }
 
-// The TikTok/Instagram tool needs a worker: Docker on this machine, or one named
-// in SMTRANSCRIPT_WORKER_URL. A server elsewhere (inline mode) without one would
-// only offer a tool that always fails, so it does not offer it.
+// The TikTok/Instagram/Vimeo tools need a worker: Docker on this machine, or one
+// named in SMTRANSCRIPT_WORKER_URL. A server elsewhere (inline mode) without one
+// would only offer tools that always fail, so it does not offer them.
 export function tools(env = process.env) {
   const list = [{ tool: toolFor(), run: runTool }];
   if (outputMode() !== 'inline' || env.SMTRANSCRIPT_WORKER_URL) {
     list.push({ tool: socialTool(outputMode()), run: runSocialTool });
+    list.push({ tool: imagesTool(outputMode()), run: runImagesTool });
   }
   return list;
 }
@@ -302,7 +303,8 @@ export function serve({ input = process.stdin, output = process.stdout } = {}) {
       const run = tools().find((t) => t.tool.name === params?.name)?.run;
       if (!run) throw new Error(`Unknown tool: ${params?.name}`);
       const result = await run(params.arguments || {}, { notify });
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      // Pictures go along as image content; JSON.stringify leaves the symbol key out.
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }, ...(result?.[IMAGE_BLOCKS] || [])] };
     },
   };
 
