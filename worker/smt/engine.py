@@ -43,6 +43,9 @@ from .routes import Routes
 LOG = logging.getLogger("smt.engine")
 
 LEASE_S = 90
+# Instagram's picture links are signed and expire after some days; a caller who
+# waits for the pictures gets links younger than this.
+IMAGE_LINKS_FRESH_S = 6 * 3600
 MAX_ATTEMPTS = 5
 ACTIVE = ("queued", "resolving", "fetching", "processing", "retry_wait", "blocked")
 
@@ -606,9 +609,13 @@ class Engine:
         soon as it is read; the text is what stays."""
         target = guard.parse(job["input_url"])
         parts = self._parts("instagram", target.platform_id)
-        if parts and self._ocr_track(parts[0]["id"]):
-            self._set(job["id"], media_id=parts[0]["id"])
-            return self._finish(job["id"])
+        read = bool(parts and self._ocr_track(parts[0]["id"]))
+        if read:
+            fresh = _now() - json.loads(parts[0]["meta"]).get("image_links_at", 0) < IMAGE_LINKS_FRESH_S
+            if not job["priority"] or fresh:
+                self._set(job["id"], media_id=parts[0]["id"])
+                return self._finish(job["id"])
+            # Somebody waits for the pictures: their links once more, the text stays.
         count = self._count(job["id"])
         proxy = self.routes.proxy(job["route"])
         self._set(job["id"], status="resolving")
@@ -624,13 +631,16 @@ class Engine:
                 "published_at": _iso(post["taken_at"].timestamp()) if post.get("taken_at") else None,
                 "post_kind": post["kind"], "images": len(post["images"]), "videos_not_read": post["videos"],
                 # Instagram's signed CDN addresses: they expire after some days.
-                "image_urls": post["images"],
+                "image_urls": post["images"], "image_links_at": _now(),
                 "has_video": False}
         self.db.run(
             "insert into media (platform, platform_id, part, canonical_url, meta) values ('instagram', ?, 0, ?, ?)"
             " on conflict (platform, platform_id, part) do update set meta = excluded.meta",
             (target.platform_id, target.canonical_url, json.dumps(meta)))
         media = self._parts("instagram", target.platform_id)[0]
+        if read:
+            self._set(job["id"], media_id=media["id"])
+            return self._finish(job["id"])
         self._set(job["id"], status="fetching", media_id=media["id"])
         tmp = self.s.tmp_dir / job["id"]
         tmp.mkdir(parents=True, exist_ok=True)

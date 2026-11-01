@@ -702,6 +702,21 @@ class EngineTest(unittest.TestCase):
         with self.assertRaises(JobError):
             self.engine.submit_images("alice", TT)  # TikTok has no picture jobs here
 
+    def test_a_waiting_caller_gets_fresh_picture_links_without_reading_again(self):
+        self.engine.submit_images("alice", "https://www.instagram.com/p/CAROUSEL2/")
+        self.drain()
+        self.engine.db.run("update media set meta = json_set(meta, '$.image_links_at', 0)")  # days old
+        self.fake.calls = []
+        bulk, _ = self.engine.submit_images("bob", "https://www.instagram.com/p/CAROUSEL2/")
+        self.drain()
+        self.assertEqual(self.fake.calls, [])  # bulk work takes the text as it is
+        waiting, _ = self.engine.submit_images("carol", "https://www.instagram.com/p/CAROUSEL2/", {"priority": "high"})
+        self.drain()
+        self.assertEqual(self.fake.calls, ["post"])  # the links once more, no picture read again
+        result = self.engine.result(self.job(waiting["id"]))
+        self.assertEqual((result["status"], result["transcript"]["text"]), ("completed", "Tipp 1: Nießbrauch prüfen"))
+        self.assertEqual(len(result["media"]["image_urls"]), 2)
+
     def test_an_account_with_pictures(self):
         self.fake.profile_items = [
             {"id": "REEL1", "url": "https://www.instagram.com/p/REEL1/", "kind": "reel", "caption": "a",

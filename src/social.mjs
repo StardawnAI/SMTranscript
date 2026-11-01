@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { readConfig, writeConfig } from './config.mjs';
 import { warpRunFlags } from './warp.mjs';
 
-export const WORKER_VERSION = '1.2.0';
+export const WORKER_VERSION = '1.2.1';
 export const WORKER = 'smtranscript-worker';
 export const NETWORK = 'smtranscript';
 export const WARP = 'smtranscript-warp';
@@ -471,7 +471,10 @@ export async function runImagesTool(args, { notify = () => {} } = {}, deps = {})
   const worker = deps.worker || (await ensureWorker({ notify }));
   if (route === 'warp') await (deps.ensureWarp || ensureWarp)({ notify });
   const api = deps.api || client(worker);
-  const job = await api.submit({ url: input, kind: 'images', route, priority: 'high' });
+  // One job per post and day: picture links expire after some days, and the
+  // worker renews them for a new job (the text read off the pictures stays).
+  const today = new Date().toISOString().slice(0, 10);
+  const job = await api.submit({ url: input, kind: 'images', route, priority: 'high', idempotency_key: `images:${input}:${today}` });
   notify(job.existing ? `${job.job_id}: already known, reusing it` : `${job.job_id}: queued`);
   const wait = { notify, ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}), ...(deps.seconds ? { seconds: deps.seconds } : {}) };
   const result = await waitResult(api, job.job_id, wait);

@@ -219,7 +219,9 @@ const fakeImages = async (images) => images.map((i) => (i.index === 2 ? { index:
 test('a picture post: each picture with its link and text, and the pictures attached inline', async () => {
   const api = fakeApi({ results: { job_v: pictures('job_v') } });
   const out = await runImagesTool({ url: 'https://www.instagram.com/p/DfAtyePiCIS/' }, {}, deps(api, { output: 'inline', fetchImages: fakeImages }));
-  assert.deepEqual(api.calls[0], ['submit', { url: 'https://www.instagram.com/p/DfAtyePiCIS/', kind: 'images', route: 'direct', priority: 'high' }]);
+  const today = new Date().toISOString().slice(0, 10);
+  assert.deepEqual(api.calls[0], ['submit', { url: 'https://www.instagram.com/p/DfAtyePiCIS/', kind: 'images', route: 'direct', priority: 'high',
+    idempotency_key: `images:https://www.instagram.com/p/DfAtyePiCIS/:${today}` }]);
   assert.equal(out.caption, 'Drei Tipps');
   assert.deepEqual(out.images.map((i) => [i.index, i.text]), [[1, 'Tipp 1'], [2, '']]);
   assert.match(out.images[1].error, /expired/);
