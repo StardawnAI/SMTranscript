@@ -36,7 +36,7 @@ from pathlib import Path
 
 from . import understand as understand_engine
 from . import VERSION, fetch, guard, ocr as ocr_engine
-from .asr import Asr, extract_audio, has_audio
+from .asr import Asr, OpenAiAsr, extract_audio, has_audio
 from .config import Settings
 from .db import TERMINAL, Db
 from .errors import ACTIONS, JobError, classify
@@ -108,7 +108,7 @@ class Engine:
         self.routes = Routes(self.db, settings.routes, settings.gap_seconds)
         for d in (settings.media_dir, settings.tmp_dir, settings.models_dir):
             d.mkdir(parents=True, exist_ok=True)
-        self._asr_factory = asr_factory or (lambda model: Asr(model, settings.asr_device, settings.models_dir))
+        self._asr_factory = asr_factory or self._make_asr
         self._asr: dict[str, Asr] = {}
         self._asr_lock = threading.Lock()
         self._held: set[str] = set()
@@ -133,6 +133,8 @@ class Engine:
         allowed = {self.s.asr_model, *self.s.asr_models}
         if model not in allowed:
             raise JobError("invalid_input", f"asr_model must be one of {', '.join(sorted(allowed))} here")
+        if model.startswith("openai:") and "openai" not in self.model_keys:
+            raise JobError("invalid_input", f"asr_model {model}: this worker has no key for openai")
         asr = options.get("asr") or "auto"
         if asr not in ("auto", "always"):
             raise JobError("invalid_input", 'asr is "auto" (captions first) or "always"')
@@ -567,6 +569,11 @@ class Engine:
         return asr[0] if asr else None
 
     # -- asr ------------------------------------------------------------------
+
+    def _make_asr(self, name: str):
+        if name.startswith("openai:"):
+            return OpenAiAsr(name, self.model_keys.get("openai"), lambda: self._model(self.s.asr_fallback))
+        return Asr(name, self.s.asr_device, self.s.models_dir)
 
     def _model(self, name: str) -> Asr:
         with self._asr_lock:

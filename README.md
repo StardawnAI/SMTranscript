@@ -292,6 +292,14 @@ into the volume. After that a reel takes seconds.
   `SMT_OPENAI_API_KEY`; a provider without a key is refused when the job is made. Asking
   again with another model is a new job; what is known already (the transcript, the text on
   the pictures) is not made again.
+- **Speech to text in the cloud, when it is the faster way:** `SMT_ASR_MODEL=openai:gpt-4o-mini-transcribe`
+  sends the audio to OpenAI (key in `SMT_OPENAI_API_KEY`) instead of running Whisper here.
+  Whether anyone speaks is still decided on the worker by the same VAD Whisper uses, so music
+  and silence never leave it; the transcript is one segment without timestamps, and the
+  tokens OpenAI reports are kept with it. When OpenAI cannot answer, or the audio is over
+  ~13 minutes, the local model (`SMT_ASR_FALLBACK`, default `large-v3-turbo`) does it and the
+  job says why. Measured on stardawneg64 (2026-11-02): three waiting reels of 8-54 s took
+  1.6-13.9 s each; the local model there managed 4-27 reels an hour.
 - **Somebody waiting goes first:** a job with `"priority": "high"` (the MCP tools send it) is
   claimed before bulk work on the same worker, and its video is fetched at once.
 - Private videos, and videos that need an account, are reported as such. Logged-in sessions are

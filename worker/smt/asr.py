@@ -1,10 +1,14 @@
-"""Speech to text on this machine, with faster-whisper.
+"""Speech to text, with faster-whisper on this machine or OpenAI's API.
 
 One model per process, loaded on first use and kept: loading large-v3-turbo
 takes longer than transcribing a whole reel, so a model per job would spend
 most of its time loading. On an NVIDIA card it runs in float16, otherwise on
-the CPU in int8. There is no cloud fallback — a transcript that cannot be
-made here is reported as not made.
+the CPU in int8.
+
+A model named "openai:<model>" (OpenAiAsr) sends the audio to OpenAI
+instead, with the local model as its fallback. On stardawneg64's CPU, held
+down by its thermal guard, large-v3-turbo finished 4-27 reels an hour over
+the twelve hours to 2026-11-02 13:00 UTC (from the StarBase database).
 
 Silence and music are valid input. The VAD filter keeps Whisper from being
 fed stretches without speech, which is where it invents text; what still
@@ -15,14 +19,23 @@ flagged rather than passed off as a clean transcript.
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import re
+import secrets
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 LOG = logging.getLogger("smt.asr")
+
+OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions"
+# Under the API's 25 MB upload limit: 16 kHz mono WAV is 32 KB a second, so
+# about 13 minutes. Longer audio goes to the local model.
+OPENAI_UPLOAD_LIMIT = 24 * 1024 * 1024
 
 
 def has_audio(path: Path) -> bool:
@@ -182,4 +195,94 @@ class Asr:
             "model": self.name,
             "model_revision": self.revision,
             "params": {**params, "device": self.device, "compute_type": self.compute_type, "language": language},
+        }
+
+
+def speech_seconds(wav: Path) -> tuple[float, float]:
+    """(audio seconds, speech seconds) by Silero VAD, the filter the local
+    model runs before it transcribes."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    samples = read_wav(wav)
+    stamps = get_speech_timestamps(samples, VadOptions())
+    return len(samples) / 16000, sum(s["end"] - s["start"] for s in stamps) / 16000
+
+
+def openai_transcribe(key: str, model: str, wav: Path, language: str | None, timeout: int = 300) -> dict:
+    """One file to OpenAI's transcription endpoint, as multipart form data."""
+    boundary = secrets.token_hex(16)
+    fields = {"model": model, "response_format": "json", "chunking_strategy": "auto"}
+    if language:
+        fields["language"] = language
+    body = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields.items()
+    ) + (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+         f"Content-Type: audio/wav\r\n\r\n").encode() + wav.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(OPENAI_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {key}", "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"OpenAI HTTP {exc.code}: {exc.read().decode(errors='replace')[:300]}") from exc
+
+
+class OpenAiAsr:
+    """Speech to text with OpenAI, the local model when OpenAI cannot.
+
+    Whether anyone speaks is still decided here, by the same VAD the local
+    model uses: music and silence never leave the machine and cost nothing.
+    The API returns the text without timestamps, so a transcript is one
+    segment over the whole audio - for a reel of under a minute that is
+    what a reader needs. The tokens it reports are kept with the track, so
+    what a run cost is computed from them, not guessed.
+    """
+
+    def __init__(self, name: str, key: str | None, fallback, post=openai_transcribe, vad=speech_seconds):
+        self.name = name
+        self.api_model = name.split(":", 1)[1]
+        self.key = key
+        self.fallback = fallback
+        self.device, self.compute_type, self.revision = "openai", None, None
+        self._post = post
+        self._vad = vad
+
+    def load(self):
+        return self
+
+    def _local(self, wav: Path, language: str | None, why: str) -> dict:
+        LOG.warning("%s: transcribing locally instead: %s", self.name, why)
+        result = self.fallback().transcribe(wav, language)
+        result["quality"]["flags"] = [why[:200], *result["quality"].get("flags", [])]
+        return result
+
+    def transcribe(self, wav: Path, language: str | None = None) -> dict:
+        started = time.time()
+        audio, speech = self._vad(wav)
+        params = {"backend": "openai", "chunking_strategy": "auto", "language": language}
+        quality = {"flags": [], "audio_seconds": round(audio, 2), "speech_seconds": round(speech, 2)}
+        if speech < 1.0:
+            return {"status": "no_speech", "language": None, "segments": [], "text": "",
+                    "quality": {**quality, "seconds": round(time.time() - started, 2)},
+                    "model": self.name, "model_revision": None, "params": params}
+        if not self.key:
+            return self._local(wav, language, "openai_failed: no OpenAI key on this worker")
+        if wav.stat().st_size > OPENAI_UPLOAD_LIMIT:
+            return self._local(wav, language, "too_long_for_openai")
+        try:
+            out = self._post(self.key, self.api_model, wav, language)
+        except Exception as exc:  # noqa: BLE001 — any failure: the local model answers
+            return self._local(wav, language, f"openai_failed: {exc}")
+        text = (out.get("text") or "").strip()
+        segments = [{"start_ms": 0, "end_ms": int(audio * 1000), "text": text}] if text else []
+        return {
+            "status": "available" if segments else "no_speech",
+            "language": language if segments else None,
+            "segments": segments,
+            "text": text,
+            "quality": {**quality, "seconds": round(time.time() - started, 2),
+                        **({"usage": out["usage"]} if out.get("usage") else {})},
+            "model": self.name,
+            "model_revision": None,
+            "params": params,
         }

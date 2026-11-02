@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from smt import captions, config, fetch, guard  # noqa: E402
 from smt.api import serve  # noqa: E402
-from smt.asr import judge, quality  # noqa: E402
+from smt.asr import OpenAiAsr, judge, quality  # noqa: E402
 from smt.engine import Engine, MAX_ATTEMPTS  # noqa: E402
 from smt.errors import JobError, classify  # noqa: E402
 
@@ -964,6 +964,70 @@ class ApiTest(unittest.TestCase):
         _, body, _ = self.call("GET", "/v1/routes", key="r" * 20)
         self.assertIn("someone else's link", json.dumps(body))
         self.engine.routes.unblock("tiktok", "warp")
+
+
+class OpenAiAsrTest(unittest.TestCase):
+    """Reels to OpenAI: speech found here first, the local model when OpenAI
+    cannot answer, and the tokens kept for what it cost."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.wav = self.tmp / "a.wav"
+        self.wav.write_bytes(b"RIFF" + b"\0" * 2000)
+        self.posts = []
+        self.local = FakeAsr()
+        self.local.transcribe = lambda wav, language=None: {
+            "status": "available", "language": "de", "segments": [{"start_ms": 0, "end_ms": 900, "text": "lokal"}],
+            "text": "lokal", "quality": {"flags": []}, "model": "large-v3-turbo", "model_revision": "abc", "params": {}}
+
+    def asr(self, speech=12.0, answer=None, fail=None, key="sk-test"):
+        def post(key, model, wav, language):
+            self.posts.append((key, model, wav, language))
+            if fail:
+                raise fail
+            return answer or {"text": " Hallo zusammen. ", "usage": {"type": "tokens", "input_tokens": 400, "output_tokens": 9}}
+        return OpenAiAsr("openai:gpt-4o-mini-transcribe", key, lambda: self.local, post=post,
+                         vad=lambda wav: (48.1, speech))
+
+    def test_speech_goes_to_openai_as_one_segment_with_its_tokens(self):
+        out = self.asr().transcribe(self.wav)
+        self.assertEqual(self.posts[0][:2], ("sk-test", "gpt-4o-mini-transcribe"))
+        self.assertEqual(out["status"], "available")
+        self.assertEqual(out["segments"], [{"start_ms": 0, "end_ms": 48100, "text": "Hallo zusammen."}])
+        self.assertEqual(out["model"], "openai:gpt-4o-mini-transcribe")
+        self.assertEqual(out["quality"]["usage"]["input_tokens"], 400)
+        self.assertEqual(out["quality"]["speech_seconds"], 12.0)
+        self.assertEqual(out["params"]["backend"], "openai")
+
+    def test_music_never_leaves_the_machine(self):
+        out = self.asr(speech=0.4).transcribe(self.wav)
+        self.assertEqual(self.posts, [])
+        self.assertEqual((out["status"], out["text"], out["language"]), ("no_speech", "", None))
+
+    def test_openai_failing_means_the_local_model_answers_and_says_why(self):
+        out = self.asr(fail=RuntimeError("OpenAI HTTP 429: quota")).transcribe(self.wav)
+        self.assertEqual(out["text"], "lokal")
+        self.assertEqual(out["model"], "large-v3-turbo")
+        self.assertEqual(out["quality"]["flags"], ["openai_failed: OpenAI HTTP 429: quota"])
+
+    def test_without_a_key_or_with_long_audio_the_local_model_answers(self):
+        self.assertEqual(self.asr(key=None).transcribe(self.wav)["text"], "lokal")
+        self.wav.write_bytes(b"\0" * (24 * 1024 * 1024 + 1))
+        out = self.asr().transcribe(self.wav)
+        self.assertEqual((out["text"], out["quality"]["flags"]), ("lokal", ["too_long_for_openai"]))
+        self.assertEqual(self.posts, [])
+
+    def test_an_openai_model_is_refused_where_the_worker_has_no_key(self):
+        data = self.tmp / "data"
+        engine = Engine(settings(data, asr_model="openai:gpt-4o-mini-transcribe"), asr_factory=lambda _m: self.local)
+        engine.model_keys = {}
+        with self.assertRaises(JobError) as err:
+            engine._options({})
+        self.assertIn("no key for openai", str(err.exception))
+        engine.model_keys = {"openai": "sk-test"}
+        self.assertEqual(engine._options({})["asr_model"], "openai:gpt-4o-mini-transcribe")
+        self.assertIsInstance(engine._make_asr("openai:gpt-4o-mini-transcribe"), OpenAiAsr)
 
 
 if __name__ == "__main__":

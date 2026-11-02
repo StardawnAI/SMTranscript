@@ -56,6 +56,8 @@ class Settings:
     keep_media: bool = True
     # Video fetches wait while this many files already wait for Whisper.
     asr_backlog: int = 3
+    # What an "openai:" model falls back to when OpenAI cannot answer.
+    asr_fallback: str = "large-v3-turbo"
 
     @property
     def db_path(self) -> Path:
@@ -126,6 +128,7 @@ def load() -> Settings:
         asr_models=tuple(m.strip() for m in os.environ.get("SMT_ASR_MODELS", "small").split(",") if m.strip()),
         keep_media=os.environ.get("SMT_KEEP_MEDIA", "1") != "0",
         asr_backlog=_int("SMT_ASR_BACKLOG", 3),
+        asr_fallback=os.environ.get("SMT_ASR_FALLBACK", "large-v3-turbo"),
         cookies_dir=Path(cookies) if cookies else None,
         instaloader_session=Path(session) if session else None,
         instagram_user=os.environ.get("SMT_INSTAGRAM_USER") or None,
