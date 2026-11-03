@@ -48,6 +48,7 @@ class JobError(Exception):
 # Checked in order; the first match wins. The texts are yt-dlp's and
 # Instaloader's own messages (yt-dlp 2026.10.26, Instaloader 4.16).
 _RULES = [
+    ("challenge", r"\bfeedback_required\b"),
     ("rate_limited", r"HTTP Error 429|Too Many Requests|rate-?limit|Please wait a few minutes"),
     ("challenge", r"TikTok is requiring login|checkpoint|challenge_required"),
     ("route_down", r"Unable to connect to proxy|ProxyError|SOCKS|Tunnel connection failed|proxy.*refused"),

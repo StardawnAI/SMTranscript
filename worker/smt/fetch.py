@@ -244,12 +244,13 @@ def _instaloader(proxy: str | None, count, session: Path | None, user: str | Non
         save_metadata=False, compress_json=False, max_connection_attempts=1,
         rate_controller=lambda ctx: Refuse(ctx),
     )
+    if session and user and session.is_file():
+        loader.load_session_from_file(user, str(session))
+    # Loading saved cookies replaces the HTTP session; configure the final one.
     sess = loader.context._session
     if proxy:
         sess.proxies = {"http": proxy, "https": proxy}
     sess.trust_env = False
-    if session and user and session.is_file():
-        loader.load_session_from_file(user, str(session))
     return loader
 
 
