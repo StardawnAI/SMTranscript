@@ -247,11 +247,39 @@ def _instaloader(proxy: str | None, count, session: Path | None, user: str | Non
     if session and user and session.is_file():
         loader.load_session_from_file(user, str(session))
     # Loading saved cookies replaces the HTTP session; configure the final one.
-    sess = loader.context._session
-    if proxy:
-        sess.proxies = {"http": proxy, "https": proxy}
-    sess.trust_env = False
+    _route_instaloader_requests(loader.context, proxy)
+    query = loader.context.doc_id_graphql_query
+
+    def metadata_query(doc_id, variables, referer=None, web_api=False):
+        # 4.16 migrated timelines but left authenticated profile/post metadata
+        # on the old endpoint. Use its existing web-token handling for these too.
+        if loader.context.is_logged_in and doc_id in {"27937681195819736", "27128499623469141"}:
+            web_api = True
+        return query(doc_id, variables, referer=referer, web_api=web_api)
+
+    loader.context.doc_id_graphql_query = metadata_query
     return loader
+
+
+def _route_instaloader_requests(context, proxy: str | None):
+    """Instaloader 4.16 copies sessions without their route settings."""
+    def routed(session):
+        session.proxies = {"http": proxy, "https": proxy} if proxy else {}
+        session.trust_env = False
+        return session
+
+    get_json, get_page = context.get_json, context._get_page
+
+    def routed_json(path, params, host="www.instagram.com", session=None,
+                    response_headers=None, use_post=False):
+        return get_json(path, params, host=host, session=routed(session or context._session),
+                        response_headers=response_headers, use_post=use_post)
+
+    def routed_page(session, path):
+        return get_page(routed(session), path)
+
+    routed(context._session)
+    context.get_json, context._get_page = routed_json, routed_page
 
 
 def _post_kind(post) -> str:
@@ -341,7 +369,16 @@ def instagram_profile(account: str, limit: int, since: dt.datetime | None, proxy
     try:
         loader = _instaloader(proxy, count, session, user)
         if loader.context.is_logged_in:
-            posts, describe = instaloader.Profile.from_username(loader.context, account).get_posts(), _describe_post
+            owner_id = loader.context._session.cookies.get_dict().get("ds_user_id", "")
+            if account.lower() == loader.context.username.lower() and owner_id.isdigit():
+                # from_username first fetches an anonymous page, which may require
+                # login even though the owner already supplied a valid session.
+                profile = instaloader.Profile.from_id(loader.context, int(owner_id))
+                if profile.username.lower() != account.lower():
+                    raise JobError("login_required", "the Instagram session belongs to a different account")
+            else:
+                profile = instaloader.Profile.from_username(loader.context, account)
+            posts, describe = profile.get_posts(), _describe_post
         else:
             posts, describe = _logged_out_timeline(loader.context, account), _describe_node
         if cursor:

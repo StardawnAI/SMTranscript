@@ -16,7 +16,9 @@ from smt import fetch  # noqa: E402
 
 class FakeInstaloader:
     def __init__(self, **kwargs):
-        self.context = SimpleNamespace(_session=self.new_session())
+        self.context = SimpleNamespace(_session=self.new_session(), get_json=lambda *a, **kw: None,
+                                       _get_page=lambda *a, **kw: None,
+                                       doc_id_graphql_query=lambda *a, **kw: None)
 
     @staticmethod
     def new_session():
