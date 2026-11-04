@@ -1,0 +1,10 @@
+{
+  "name": "smtranscript-relay",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-04",
+  "workers_dev": true,
+  "vars": { "DAILY_EUR_LIMIT": "0.25" },
+  "durable_objects": { "bindings": [{ "name": "BUDGET", "class_name": "Budget" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Budget"] }],
+  "observability": { "enabled": false }
+}

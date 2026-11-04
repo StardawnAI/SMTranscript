@@ -153,6 +153,17 @@ class Session:
             raise JobError("unavailable", f"{url} has no video in it")
         return videos
 
+    def remote_source(self, info: dict) -> dict:
+        """Pass only a media URL and its scoped session headers to the relay."""
+        import urllib.request
+        from .relay import select_source
+        source = select_source(info)
+        request = urllib.request.Request(source["url"])
+        self._ydl.cookiejar.add_cookie_header(request)
+        if request.has_header("Cookie"):
+            source["headers"]["Cookie"] = request.get_header("Cookie")
+        return source
+
     def download(self, info: dict, tmp: Path, captions_only: bool = False) -> dict:
         """Downloads the video (or its audio) and the captions of an entry
         this session resolved, without asking for the page again. With
