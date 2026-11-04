@@ -251,6 +251,7 @@ class ErrorsTest(unittest.TestCase):
             "You do not have permission to view this post. Log into an account that has access": "private",
             "Restricted Video: You must be 18 years old. Use --cookies": "login_required",
             "Unable to connect to proxy: [Errno 111] Connection refused": "route_down",
+            "HTTP Error 429: Too Many Requests": "rate_limited",
             "<urlopen error timed out>": "network",
             "HTTP Error 403: Forbidden": "expired_link",
             "ERROR: Unsupported URL: https://x": "parser",
@@ -258,6 +259,22 @@ class ErrorsTest(unittest.TestCase):
         }
         for message, want in cases.items():
             self.assertEqual(classify(RuntimeError(message)).cls, want, message)
+
+    def test_feedback_required_stops_the_route_even_with_a_wait_message(self):
+        observed = ('400 Bad Request - "fail" status, message "feedback_required" '
+                    'when accessing https://www.instagram.com/graphql/query')
+        for message in (observed, observed + ". Please wait a few minutes"):
+            with self.subTest(message=message):
+                self.assertEqual(classify(RuntimeError(message)).cls, "challenge")
+
+    def test_feedback_required_in_a_link_or_video_id_cannot_stop_the_route(self):
+        cases = {
+            "ERROR: [Instagram] feedback_required: Requested content is not available": "unavailable",
+            "ERROR: Unsupported URL: https://www.instagram.com/feedback_required/": "parser",
+        }
+        for message, want in cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(classify(RuntimeError(message)).cls, want)
 
     def test_a_chosen_video_id_cannot_fake_a_class(self):
         for message in ("ERROR: [Instagram] rate-limit: Requested content is not available",

@@ -120,6 +120,8 @@ class Engine:
         self.ocr = ocr or ocr_engine.read_text
         self.understand = understand_engine
         self.model_keys = understand_engine.available()
+        from .relay import RemoteAsr
+        self.relay = RemoteAsr.from_env()
 
     # ------------------------------------------------------------------
     # Accepting work
@@ -135,6 +137,11 @@ class Engine:
             raise JobError("invalid_input", f"asr_model must be one of {', '.join(sorted(allowed))} here")
         if model.startswith("openai:") and "openai" not in self.model_keys:
             raise JobError("invalid_input", f"asr_model {model}: this worker has no key for openai")
+        if model.startswith("groq:"):
+            if model != "groq:whisper-large-v3-turbo" or self.relay is None:
+                raise JobError("invalid_input", "Groq streaming transcription is not configured here")
+            if self.s.keep_media or options.get("describe_video"):
+                raise JobError("invalid_input", "Groq streaming transcription requires media retention off and no video description")
         asr = options.get("asr") or "auto"
         if asr not in ("auto", "always"):
             raise JobError("invalid_input", 'asr is "auto" (captions first) or "always"')
@@ -431,7 +438,8 @@ class Engine:
         # A description still wanted needs the video once more.
         known = bool(parts) and all(self._chosen(p["id"], opts) and not self._needs_description(p["id"], opts)
                                     for p in parts)
-        if not known and (not parts or any(self._video(p["id"]) is None for p in parts)):
+        if not known and (opts["asr_model"].startswith("groq:") or not parts or
+                          any(self._video(p["id"]) is None for p in parts)):
             parts = self._download(job, target, parts, proxy, count)
         self._set(job["id"], media_id=parts[0]["id"])
 
@@ -460,7 +468,7 @@ class Engine:
                 parts = self._media_rows(platform, target.platform_id, target.canonical_url, infos)
                 self._set(job["id"], status="fetching")
                 for media, info in zip(parts, infos):
-                    if self._video(media["id"]) or (self._chosen(media["id"], opts)
+                    if (self._video(media["id"]) and not opts["asr_model"].startswith("groq:")) or (self._chosen(media["id"], opts)
                                                     and not self._needs_description(media["id"], opts)):
                         continue
                     duration = info.get("duration") or 0
@@ -476,6 +484,15 @@ class Engine:
                         if self._chosen(media["id"], opts):
                             continue
                         # The captions did not settle it after all: the audio, for Whisper.
+                    if opts["asr_model"].startswith("groq:"):
+                        identity = hashlib.sha256(json.dumps([job["tenant"], target.canonical_url,
+                            media["part"], opts["asr_model"], opts["language"]]).encode()).hexdigest()
+                        with self.routes.request(platform, route):
+                            result = self.relay.transcribe(ses.remote_source(info), identity, opts["language"])
+                        self._store_asr(media, result)
+                        for flag in result["quality"].get("flags", []):
+                            self._warn(job["id"], flag)
+                        continue
                     got = self._download_one(platform, route, info, tmp, ses)
                     probe = _probe_streams(got["video"])
                     # What the post is, not what was downloaded: without keep_media
@@ -626,19 +643,22 @@ class Engine:
                 self._set(job["id"], status="partial", stage=None, finished_at=_now(), error_class="internal",
                           error="transcription failed" + ("; the video is stored" if self.s.keep_media else ""))
                 return
-            self.db.run(
-                "insert into track (media_id, source, language, origin, model, model_revision, params, status,"
-                " segments, text, quality, created_at) values (?, 'asr', ?, 'speech', ?, ?, ?, ?, ?, ?, ?, ?)",
-                (media["id"], result["language"], result["model"], result["model_revision"],
-                 json.dumps(result["params"]), result["status"], json.dumps(result["segments"]), result["text"],
-                 json.dumps(result["quality"]), _now()),
-            )
+            self._store_asr(media, result)
             for flag in result["quality"].get("flags", []):
                 self._warn(job["id"], flag)
         for media in parts:
             if self._needs_description(media["id"], opts):
                 self._describe_video(job, media, opts["describe_video"])
         self._finish(job["id"], parts)
+
+    def _store_asr(self, media: dict, result: dict):
+        self.db.run(
+            "insert into track (media_id, source, language, origin, model, model_revision, params, status,"
+            " segments, text, quality, created_at) values (?, 'asr', ?, 'speech', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (media["id"], result["language"], result["model"], result["model_revision"],
+             json.dumps(result["params"]), result["status"], json.dumps(result["segments"]), result["text"],
+             json.dumps(result["quality"]), _now()),
+        )
 
     # -- understanding ----------------------------------------------------------
 
