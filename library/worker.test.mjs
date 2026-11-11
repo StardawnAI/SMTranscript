@@ -167,6 +167,7 @@ test('a database made before the content hash gets it, and keeps its texts', asy
     + ' external_id text, title text, author text, published_at text, duration_seconds real, language text,'
     + ' text text not null, segments text, meta text, bytes integer not null, created_at text not null, updated_at text not null)');
   s.db.exec("insert into item (url, text, bytes, created_at, updated_at) values ('https://a.test/1', 'alt', 3, 'x', 'x')");
+  s.db.exec('create table account (id integer primary key check (id = 1), hash text not null, name text, created_at text not null, revoked_at text)');
   new Library({ storage: s }, {});
   const columns = s.db.prepare("select name from pragma_table_info('item')").all().map((c) => c.name);
   assert.ok(columns.includes('sha'));
@@ -183,4 +184,27 @@ test('the day\'s requests are written every 50 requests, not on every one', asyn
   await call('GET', '/v1/items', { key });
   assert.equal(db.prepare('select requests from usage_day').get().requests, 50);
   assert.equal((await call('GET', '/v1/usage', { key })).data.requests_today, 51);
+});
+
+test('a key-shaped token with an invented customer id writes nothing anywhere', async () => {
+  const { env, call } = stack();
+  const invented = 'abcdefghij012345';
+  const r = await call('GET', '/v1/items', { key: `sml_${invented}_${'a'.repeat(48)}` });
+  assert.equal(r.status, 401);
+  const db = env.LIBRARY.get(invented).ctx.storage.db;
+  assert.equal(db.prepare('select count(*) as n from sqlite_master').get().n, 0, 'no table was made');
+});
+
+test('deleting frees room in a full library, and an erased customer stays empty', async () => {
+  const { env, call, customer } = stack({ MAX_CUSTOMER_BYTES: '900' });
+  const a = await customer('Kunde A');
+  await call('POST', '/v1/items', { key: a.key, body: { items: [reel(1, 'y'.repeat(150)), reel(2, 'z'.repeat(150))] } });
+  const full = await call('POST', '/v1/items', { key: a.key, body: { items: [reel(3, 'w'.repeat(150))] } });
+  assert.equal(full.data.rejected[0].reason, 'the library is full');
+  await call('DELETE', `/v1/item?url=${encodeURIComponent(reel(1, '').url)}`, { key: a.key });
+  const room = await call('POST', '/v1/items', { key: a.key, body: { items: [reel(3, 'w'.repeat(150))] } });
+  assert.equal(room.data.saved.length, 1);
+  await call('DELETE', `/v1/admin/customers/${a.customer}?erase=true`, { key: env.ADMIN_TOKEN });
+  const db = env.LIBRARY.get(a.customer).ctx.storage.db;
+  assert.equal(db.prepare('select count(*) as n from sqlite_master').get().n, 0);
 });

@@ -138,7 +138,15 @@ export class Library {
     this.ctx = ctx;
     this.env = env;
     this.limits = limits(env);
-    this.schema();
+    // Only a customer the operator created has tables. A key-shaped token with
+    // an invented customer id reaches an empty object, which stays empty:
+    // nothing is written, so nothing is kept or billed for it.
+    this.ready = this.exists();
+    if (this.ready) this.schema();
+  }
+
+  exists() {
+    return this.ctx.storage.sql.exec("select 1 from sqlite_master where type = 'table' and name = 'account'").toArray().length > 0;
   }
 
   schema() {
@@ -147,6 +155,14 @@ export class Library {
     for (const [column, statement] of ADDED) if (!columns.includes(column)) this.ctx.storage.sql.exec(statement);
     for (const statement of INDEXES) this.ctx.storage.sql.exec(statement);
     this.day = null;
+    this.total = null;
+  }
+
+  // The library's size, read once per object and kept up to date in memory:
+  // summing the table on every save would read every row each time.
+  size() {
+    if (this.total === null) this.total = this.rows('select coalesce(sum(bytes), 0) as total from item')[0].total;
+    return this.total;
   }
 
   // Every query goes through here, so the rows it wrote (what Cloudflare bills)
@@ -173,6 +189,10 @@ export class Library {
 
   async internal(path, body) {
     if (path === '/internal/init') {
+      if (!this.ready) {
+        this.schema();
+        this.ready = true;
+      }
       const [account] = this.rows('select revoked_at from account where id = 1');
       if (account && !account.revoked_at) return fail(409, 'this customer exists');
       this.rows('insert or replace into account (id, hash, name, created_at, revoked_at) values (1, ?, ?, ?, null)',
@@ -182,8 +202,9 @@ export class Library {
     if (path === '/internal/revoke') {
       if (body.erase) {
         await this.ctx.storage.deleteAll();
-        this.schema();
-      } else {
+        this.ready = false;
+        this.total = null;
+      } else if (this.ready) {
         this.rows('update account set revoked_at = ? where id = 1', now());
       }
       return json(200, { ok: true, erased: Boolean(body.erase) });
@@ -193,6 +214,7 @@ export class Library {
 
   async authenticate(request) {
     const m = KEY.exec(bearer(request));
+    if (!this.ready) return fail(401, 'missing, unknown or revoked library key');
     const [account] = this.rows('select hash, revoked_at from account where id = 1');
     if (!m || !account || account.revoked_at || !sameText(await sha256(m[2]), account.hash)) {
       return fail(401, 'missing, unknown or revoked library key');
@@ -247,7 +269,7 @@ export class Library {
         const [old] = this.rows('select id, bytes, sha from item where url = ?', item.url);
         // The same text again: nothing to write, nothing billed.
         if (old && old.sha === sha) return { id: old.id, created: false, unchanged: true };
-        const [{ total }] = this.rows('select coalesce(sum(bytes), 0) as total from item');
+        const total = this.size();
         if (total - (old?.bytes || 0) + item.bytes > this.limits.customerBytes) return { reason: 'the library is full' };
         const stamp = now();
         this.rows(
@@ -262,6 +284,7 @@ export class Library {
           item.duration_seconds, item.language, item.text, item.segments, item.meta, item.bytes, sha, stamp, stamp,
         );
         const [{ id }] = this.rows('select id from item where url = ?', item.url);
+        this.total = total - (old?.bytes || 0) + item.bytes;
         return { id, created: !old };
       });
       if (outcome.reason) rejected.push({ url: item.url, reason: outcome.reason });
@@ -295,7 +318,9 @@ export class Library {
     );
     if (!item) return fail(404, 'no such item');
     if (remove) {
+      this.size();
       this.rows('delete from item where id = ?', item.id);
+      this.total -= item.bytes;
       return json(200, { deleted: { id: item.id, url: item.url } });
     }
     const { bytes, sha, segments, meta, ...rest } = item;
