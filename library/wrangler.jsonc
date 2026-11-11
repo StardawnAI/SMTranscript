@@ -1,0 +1,16 @@
+// The customer text library. Secret: ADMIN_TOKEN_SHA256, the SHA-256 (hex) of the operator's admin token.
+{
+  "name": "smtranscript-library",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-04",
+  "workers_dev": true,
+  "vars": { "MAX_ITEM_BYTES": "1000000", "MAX_CUSTOMER_BYTES": "200000000", "MAX_DAILY_REQUESTS": "20000" },
+  "durable_objects": {
+    "bindings": [
+      { "name": "LIBRARY", "class_name": "Library" },
+      { "name": "DIRECTORY", "class_name": "Directory" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Library", "Directory"] }],
+  "observability": { "enabled": false }
+}

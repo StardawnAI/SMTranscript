@@ -15,6 +15,7 @@ import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readConfig, writeConfig } from './config.mjs';
 import { warpRunFlags } from './warp.mjs';
+import { postRecord, socialRecord } from './library.mjs';
 
 export const WORKER_VERSION = '1.3.1';
 export const WORKER = 'smtranscript-worker';
@@ -388,6 +389,7 @@ export async function runSocialTool(args, { notify = () => {} } = {}, deps = {})
     }
     if (result.status === 'failed' || result.status === 'cancelled') throw failure(result);
     const out = shape(result, { includeSegments: args.include_segments ?? true });
+    deps.keep?.(socialRecord(shape(result)));
     if (args.save_video && out.video && !inline) {
       out.video.savedTo = await api.download(out.video.artifactId, join(resolveDir(args.save_to || DEFAULT_SAVE_DIR), `${fileName(out)}.mp4`));
     }
@@ -421,6 +423,7 @@ export async function runSocialTool(args, { notify = () => {} } = {}, deps = {})
           index.set(v.job_id, { videoId: v.id, url: v.url, skipped: true, reason: r.data.error?.message || r.data.status });
           continue;
         }
+        deps.keep?.(socialRecord(shape(r.data)));
         const { fullText, ...meta } = out;
         if (inline) {
           characters += fullText.length;
@@ -483,6 +486,7 @@ export async function runImagesTool(args, { notify = () => {} } = {}, deps = {})
   }
   if (result.status === 'failed' || result.status === 'cancelled') throw failure(result);
   const out = shapeImages(result);
+  deps.keep?.(postRecord(out));
   if (args.include_images === false || !out.images.length) return out;
   const fetched = await (deps.fetchImages || fetchImages)(out.images);
   for (const f of fetched.filter((x) => x.error)) out.images[f.index - 1].error = f.error;
