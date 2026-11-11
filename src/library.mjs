@@ -4,6 +4,8 @@
 // list, read and delete it. Without them the server works as before.
 // Pictures and videos are never sent: only words.
 
+import { parseVideoId } from './youtube.mjs';
+
 const BATCH_ITEMS = 20;
 const BATCH_BYTES = 4 * 1024 * 1024;
 
@@ -93,12 +95,95 @@ export function postRecord(out) {
   };
 }
 
-// A tool that keeps what it fetched. The run hands every finished transcript to
+// The platform and video id a link names, where the link itself says them
+// (a short link like vm.tiktok.com does not). The library finds a kept text by
+// these, whichever form of the link was used: /reel/ or /p/, with or without
+// tracking parameters.
+export function linkKey(input) {
+  const text = String(input || '').trim();
+  const youtube = parseVideoId(text);
+  if (youtube) return { platform: 'youtube', external_id: youtube };
+  let url;
+  try {
+    url = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.toLowerCase().replace(/^(www|m)\./, '');
+  if (host === 'instagram.com') {
+    const m = /^\/(?:[\w.]+\/)?(?:p|reels?|tv)\/([\w-]+)/.exec(url.pathname);
+    return m ? { platform: 'instagram', external_id: m[1] } : null;
+  }
+  if (host === 'tiktok.com') {
+    const m = /\/(?:video|photo)\/(\d+)/.exec(url.pathname);
+    return m ? { platform: 'tiktok', external_id: m[1] } : null;
+  }
+  return null;
+}
+
+const clock = (ms) => new Date(ms).toISOString().slice(11, 23);
+const timedSegments = (list) => list.map((s) => ({ text: s.text, start: clock(s.start_ms), end: clock(s.end_ms), startMs: s.start_ms, endMs: s.end_ms }));
+
+// A kept text, answered the way the tool that fetched it answers.
+export function fromLibrary(item, { segments = true } = {}) {
+  const meta = item.meta || {};
+  return {
+    ...(item.platform === 'youtube' ? {} : { platform: item.platform }),
+    videoId: item.external_id,
+    url: item.url,
+    title: item.title,
+    author: item.author,
+    ...(item.published_at ? { publishedAt: item.published_at } : {}),
+    durationSeconds: item.duration_seconds,
+    language: item.language,
+    ...(meta.source ? { source: meta.source } : {}),
+    ...(meta.model ? { model: meta.model } : {}),
+    fullText: item.text,
+    totalSegments: (item.segments || []).length,
+    ...(segments ? { segments: timedSegments(item.segments || []) } : {}),
+    library: { reused: true, id: item.id, keptAt: item.updated_at },
+    note: 'From your library: this video was transcribed before, so it was not fetched again. Delete it with library_delete to fetch it anew.',
+  };
+}
+
+// Which kept text would answer this call, if any: one video, asked for by a
+// link that names it. A playlist, a search or an account is fetched as before.
+export function reusable(toolName, args) {
+  if (toolName === 'get_youtube_transcript') {
+    if (args.url_type && args.url_type !== 'video') return null;
+    const id = parseVideoId(String(args.youtube_url || '').trim());
+    return id ? { key: { platform: 'youtube', external_id: id }, segments: args.include_segments ?? true } : null;
+  }
+  if (toolName === 'get_social_transcript') {
+    if (args.url_type && args.url_type !== 'video') return null;
+    const key = linkKey(args.url);
+    return key && key.platform !== 'youtube' ? { key, segments: args.include_segments ?? true } : null;
+  }
+  return null;
+}
+
+async function reuse(library, want) {
+  if (!want) return null;
+  try {
+    const item = await library.get(want.key);
+    if (item.kind !== 'video' || !String(item.text || '').trim()) return null;
+    if (want.segments && !(item.segments || []).length) return null;
+    return fromLibrary(item, { segments: want.segments });
+  } catch {
+    // Not kept, or the library cannot answer: fetch as usual.
+    return null;
+  }
+}
+
+// A tool that answers from the library when the text is already kept, and
+// keeps what it fetched otherwise. The run hands every finished transcript to
 // `keep`; they are saved once the run ends, also when it ends with an error, so
 // nothing fetched is lost. A failed save never fails the transcript: the answer
 // says so instead.
-export function keeping(run, library) {
+export function keeping(run, library, toolName) {
   return async (args, ctx = {}, deps = {}) => {
+    const kept = await reuse(library, reusable(toolName, args || {}));
+    if (kept) return kept;
     const records = [];
     const keep = (record) => {
       if (record?.url && String(record.text || '').trim()) records.push(record);
@@ -114,7 +199,8 @@ export function keeping(run, library) {
     if (records.length) {
       try {
         const s = await library.save(records);
-        note = { kept: s.saved.length, ...(s.rejected.length ? { notKept: s.rejected } : {}) };
+        const unchanged = s.saved.filter((x) => x.unchanged).length;
+        note = { kept: s.saved.length, ...(unchanged ? { unchanged } : {}), ...(s.rejected.length ? { notKept: s.rejected } : {}) };
       } catch (e) {
         note = { error: `${e.message}; the text was fetched but not kept in the library` };
       }

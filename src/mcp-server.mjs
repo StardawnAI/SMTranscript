@@ -9,7 +9,7 @@ import { dockerAvailable, rotate as rotateWarp, start as startWarp } from './war
 import { IMAGE_BLOCKS, imagesTool, runImagesTool, runSocialTool, socialTool } from './social.mjs';
 import { keeping, libraryFromEnv, libraryTools, youtubeRecord } from './library.mjs';
 
-export const VERSION = '3.3.0';
+export const VERSION = '3.3.1';
 const PROTOCOL = '2025-06-18';
 const DELAY_MS = Number(process.env.YOUTUBE_TRANSCRIPT_DELAY_MS || 1000);
 const CONCURRENCY = Number(process.env.YOUTUBE_TRANSCRIPT_CONCURRENCY || 3);
@@ -277,7 +277,7 @@ export function tools(env = process.env, library = libraryFromEnv(env)) {
     list.push({ tool: imagesTool(outputMode()), run: runImagesTool });
   }
   if (!library) return list;
-  return [...list.map(({ tool, run }) => ({ tool, run: keeping(run, library) })), ...libraryTools(library)];
+  return [...list.map(({ tool, run }) => ({ tool, run: keeping(run, library, tool.name) })), ...libraryTools(library)];
 }
 
 // ---------------------------------------------------------------------------

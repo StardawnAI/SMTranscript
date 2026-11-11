@@ -8,8 +8,10 @@ export function storage() {
   const s = { db: new DatabaseSync(':memory:') };
   s.sql = {
     exec(query, ...bindings) {
+      const before = s.db.prepare('select total_changes() as n').get().n;
       const rows = s.db.prepare(query).all(...bindings);
-      return { toArray: () => rows, one: () => rows[0] };
+      const rowsWritten = s.db.prepare('select total_changes() as n').get().n - before;
+      return { toArray: () => rows, one: () => rows[0], rowsWritten };
     },
   };
   s.transactionSync = (fn) => {

@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../library/worker.mjs';
 import { cloudflareEnv } from '../library/fake-cloudflare.mjs';
-import { keeping, libraryClient, libraryFromEnv, postRecord } from '../src/library.mjs';
+import { keeping, libraryClient, libraryFromEnv, linkKey, postRecord } from '../src/library.mjs';
 import { collectTranscripts, tools } from '../src/mcp-server.mjs';
 import { runImagesTool, runSocialTool } from '../src/social.mjs';
 
@@ -141,4 +141,56 @@ test('YouTube transcripts of a playlist run are kept one by one', async () => {
   assert.deepEqual(out.library, { kept: 2 });
   const found = await library.search({ q: 'Inhalt', platform: 'youtube' });
   assert.deepEqual(found.results.map((r) => r.title).sort(), ['Folge v1', 'Folge v2']);
+});
+
+test('a link names its video however it is written', () => {
+  const cases = {
+    'https://www.instagram.com/reel/DNoIGNAu8fy/?igsh=abc': 'instagram:DNoIGNAu8fy',
+    'instagram.com/p/DNoIGNAu8fy': 'instagram:DNoIGNAu8fy',
+    'https://www.instagram.com/immo.kanal/reel/DNoIGNAu8fy/': 'instagram:DNoIGNAu8fy',
+    'https://www.tiktok.com/@tagesschau/video/7702581353048624387?lang=de': 'tiktok:7702581353048624387',
+    'https://youtu.be/jNQXAC9IVRw?t=3': 'youtube:jNQXAC9IVRw',
+    'https://vm.tiktok.com/ZMabc/': null,
+    'https://www.instagram.com/tagesschau/': null,
+    'https://instagram.com.evil.test/p/X/': null,
+  };
+  for (const [link, want] of Object.entries(cases)) {
+    const key = linkKey(link);
+    assert.equal(key ? `${key.platform}:${key.external_id}` : null, want, link);
+  }
+});
+
+test('a reel that is already kept comes from the library; the worker is not asked', async () => {
+  const { library } = await libraryFor('Kunde A');
+  const tool = 'get_social_transcript';
+  const result = { ...reelResult('DNoIGNAu8fy', 'Abschreibung bei Neubauten'),
+    media: { platform: 'instagram', platform_id: 'DNoIGNAu8fy', canonical_url: 'https://www.instagram.com/p/DNoIGNAu8fy/', author: 'immo.kanal' } };
+  await keeping(runSocialTool, library, tool)({ url: 'https://www.instagram.com/reel/DNoIGNAu8fy/' }, {}, deps(fakeApi({ DNoIGNAu8fy: result })));
+  const untouchable = { submit: async () => { throw new Error('the worker was asked'); }, result: async () => { throw new Error('the worker was asked'); } };
+  const again = await keeping(runSocialTool, library, tool)({ url: 'https://www.instagram.com/p/DNoIGNAu8fy/?igsh=x' }, {}, deps(untouchable));
+  assert.equal(again.library.reused, true);
+  assert.equal(again.fullText, 'Abschreibung bei Neubauten');
+  assert.equal(again.segments[0].start, '00:00:00.000');
+  assert.equal(again.platform, 'instagram');
+});
+
+test('a kept YouTube text without timestamps is reused only when none are asked for', async () => {
+  const { library } = await libraryFor('Kunde A');
+  await library.save([{ url: 'https://www.youtube.com/watch?v=jNQXAC9IVRw', platform: 'youtube', kind: 'video', external_id: 'jNQXAC9IVRw', text: 'elephants' }]);
+  let fetched = 0;
+  const run = keeping(async () => { fetched += 1; return { videoId: 'jNQXAC9IVRw', fullText: 'fresh' }; }, library, 'get_youtube_transcript');
+  const plain = await run({ youtube_url: 'https://youtu.be/jNQXAC9IVRw', include_segments: false });
+  assert.equal(plain.library.reused, true);
+  assert.equal(fetched, 0);
+  await run({ youtube_url: 'https://youtu.be/jNQXAC9IVRw' });
+  assert.equal(fetched, 1, 'timestamps were asked for and are not kept, so it is fetched');
+  await run({ youtube_url: 'claude code tips', url_type: 'search' });
+  assert.equal(fetched, 2, 'a search is never answered from the library');
+});
+
+test('a library that cannot answer the lookup does not stop the fetch', async () => {
+  const down = libraryClient({ url: 'https://library.test', key: 'sml_x' }, async () => { throw new Error('offline'); });
+  const out = await keeping(runSocialTool, down, 'get_social_transcript')({ url: 'https://www.instagram.com/reel/R1/' }, {}, deps(fakeApi({ R1: reelResult('R1', 'trotzdem da') })));
+  assert.equal(out.fullText, 'trotzdem da');
+  assert.match(out.library.error, /not kept/);
 });

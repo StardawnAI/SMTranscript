@@ -2,8 +2,9 @@
 // triggers run for real; only the Cloudflare plumbing around them is faked.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { ftsQuery, normalize } from './worker.mjs';
-import { cloudflareEnv } from './fake-cloudflare.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import worker, { Library, ftsQuery, normalize } from './worker.mjs';
+import { cloudflareEnv, storage } from './fake-cloudflare.mjs';
 
 function stack(vars = {}) {
   const env = cloudflareEnv(vars);
@@ -135,4 +136,51 @@ test('broken input is refused with a reason, not a crash', async () => {
     method: 'POST', headers: { authorization: `Bearer ${key}` }, body: '{',
   }), (await stack()).env);
   assert.equal(notJson.status, 401, 'an unknown customer is refused before its body is read');
+});
+
+test('the same text saved again writes nothing; a changed one is written', async () => {
+  const { call, customer } = stack();
+  const { key } = await customer('Kunde A');
+  const first = await call('POST', '/v1/items', { key, body: { items: [reel(1, 'Erbschaftsteuer sparen')] } });
+  assert.ok(first.data.rows_written > 0);
+  const again = await call('POST', '/v1/items', { key, body: { items: [reel(1, 'Erbschaftsteuer sparen')] } });
+  assert.equal(again.data.saved[0].unchanged, true);
+  assert.equal(again.data.rows_written, 0);
+  const changed = await call('POST', '/v1/items', { key, body: { items: [reel(1, 'Erbschaftsteuer sparen 2027')] } });
+  assert.equal(changed.data.saved[0].unchanged, undefined);
+  assert.ok(changed.data.rows_written > 0);
+});
+
+test('a kept text is found by its platform and video id', async () => {
+  const { call, customer } = stack();
+  const { key } = await customer('Kunde A');
+  await call('POST', '/v1/items', { key, body: { items: [reel(7, 'Notarkosten')] } });
+  const found = await call('GET', '/v1/item?platform=instagram&external_id=R7', { key });
+  assert.equal(found.data.text, 'Notarkosten');
+  assert.equal(found.data.sha, undefined, 'the content hash stays inside');
+  assert.equal((await call('GET', '/v1/item?platform=tiktok&external_id=R7', { key })).status, 404);
+});
+
+test('a database made before the content hash gets it, and keeps its texts', async () => {
+  const s = storage();
+  s.db.exec('create table item (id integer primary key, url text not null unique, platform text, kind text,'
+    + ' external_id text, title text, author text, published_at text, duration_seconds real, language text,'
+    + ' text text not null, segments text, meta text, bytes integer not null, created_at text not null, updated_at text not null)');
+  s.db.exec("insert into item (url, text, bytes, created_at, updated_at) values ('https://a.test/1', 'alt', 3, 'x', 'x')");
+  new Library({ storage: s }, {});
+  const columns = s.db.prepare("select name from pragma_table_info('item')").all().map((c) => c.name);
+  assert.ok(columns.includes('sha'));
+  assert.equal(s.db.prepare('select text from item').get().text, 'alt');
+  assert.ok(s.db instanceof DatabaseSync);
+});
+
+test('the day\'s requests are written every 50 requests, not on every one', async () => {
+  const { env, call, customer } = stack();
+  const { key, customer: id } = await customer('Kunde A');
+  const db = env.LIBRARY.get(id).ctx.storage.db;
+  for (let i = 0; i < 49; i += 1) await call('GET', '/v1/items', { key });
+  assert.equal(db.prepare('select count(*) as n from usage_day').get().n, 0);
+  await call('GET', '/v1/items', { key });
+  assert.equal(db.prepare('select requests from usage_day').get().requests, 50);
+  assert.equal((await call('GET', '/v1/usage', { key })).data.requests_today, 51);
 });

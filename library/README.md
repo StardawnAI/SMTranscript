@@ -63,12 +63,12 @@ Customer routes take `Authorization: Bearer sml_...`:
 
 | Route                                            | What it does                                                                                                                                                                                                                                     |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `POST /v1/items`                                 | Keeps 1 to 50 items `{url, text, platform, kind, external_id, title, author, published_at, duration_seconds, language, segments, meta}`. The same `url` again replaces its item. Answers `{saved, rejected}`, each rejected item with its reason |
+| `POST /v1/items` | Keeps 1 to 50 items `{url, text, platform, kind, external_id, title, author, published_at, duration_seconds, language, segments, meta}`. The same `url` again replaces its item; the same content again writes nothing and answers `unchanged: true`. Answers `{saved, rejected, rows_written}`, each rejected item with its reason |
 | `GET /v1/items?platform=&author=&limit=&before=` | Lists items newest first, without their text; `next_before` pages on                                                                                                                                                                             |
-| `GET /v1/item?id=` or `?url=`                    | One item in full                                                                                                                                                                                                                                 |
-| `DELETE /v1/item?id=` or `?url=`                 | Deletes one item                                                                                                                                                                                                                                 |
+| `GET /v1/item?id=`, `?url=` or `?platform=&external_id=` | One item in full |
+| `DELETE /v1/item?id=`, `?url=` or `?platform=&external_id=` | Deletes one item |
 | `GET /v1/search?q=&platform=&limit=`             | Full-text search; every word is a quoted prefix term, so no input is read as FTS5 syntax                                                                                                                                                         |
-| `GET /v1/usage`                                  | Items, bytes, requests today and the limits                                                                                                                                                                                                      |
+| `GET /v1/usage` | Items, bytes of content, `database_bytes` (the size Cloudflare bills), requests today and the limits |
 
 Operator routes take `Authorization: Bearer <admin token>`:
 
@@ -88,16 +88,37 @@ Set as variables in `wrangler.jsonc`:
 | `MAX_CUSTOMER_BYTES` | 200,000,000 | One customer's library; beyond it new items are refused as "the library is full" |
 | `MAX_DAILY_REQUESTS` | 20,000      | Requests per customer per UTC day; beyond it 429                                 |
 
-A request body is at most 5 MB.
+A request body is at most 5 MB. The day's request count is kept in memory and written every
+50 requests, so counting does not itself write a row per request; an object Cloudflare
+evicts can forget up to 49 of them.
 
 ## Cost
 
-Measured on 2026-11-11 in the worker's database: a reel transcript averages about 800
-characters of text and 1,150 of timed segments, a picture description about 3,400. With the
-search index that is roughly 3 to 4 KB per reel. Cloudflare's price for SQLite in Durable
-Objects on Workers Paid (checked 2026-11-11): 5 GB-month included, then USD 0.20 per
-GB-month; 50 million rows written and 25 billion rows read a month included. A million
-kept reels fit in the included storage.
+Measured on 2026-11-11 against the deployed worker with 100 real reel transcripts
+(1,176 characters of text on average, with timed segments), and confirmed by Cloudflare's
+own analytics for that hour (446 rows written):
+
+| Per reel | Measured |
+| --- | --- |
+| Rows written, new reel | 4 |
+| Rows written, same reel again | 0 |
+| Rows written, changed text | 4 |
+| Database size | about 5.5 KB (552,960 bytes for 100) |
+| Active time per request | about 10 ms |
+
+Cloudflare's prices on Workers Paid (USD 5 a month, checked 2026-11-11):
+
+| | Included a month | Beyond |
+| --- | --- | --- |
+| Durable Object rows written | 50 million | USD 1.00 per million |
+| Durable Object storage | 5 GB | USD 0.20 per GB |
+| Durable Object requests | 1 million | USD 0.15 per million |
+| Worker requests | 10 million | USD 0.30 per million |
+
+A new reel costs two requests (look up, keep) and 4 rows. A million new reels a month are
+4 million rows and 2 million requests of each kind: inside the included amounts but for
+1 million Durable Object requests (USD 0.15) and 0.5 GB of storage (USD 0.10). Rows become
+billed only beyond 12.5 million new reels a month, at USD 4 per further million.
 
 ## Develop
 

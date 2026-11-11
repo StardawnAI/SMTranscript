@@ -207,9 +207,17 @@ Set two variables where the server starts:
 
 What is kept: the link, platform, author, title, date, duration, language, the text with its
 timed segments, and for a picture post its caption and the text read off its pictures.
-Pictures, picture links and videos are never kept. Fetching the same link again replaces
-its text instead of keeping it twice. Every answer that kept something says so in its
-`library` field. When the library cannot be reached, the transcript still comes back and the
+Pictures, picture links and videos are never kept.
+
+A video that is already kept is not fetched again: `get_youtube_transcript` and
+`get_social_transcript` look it up first, by platform and video id, so `/reel/` and `/p/`
+links, links with tracking parameters and youtu.be links all find it. The answer then has
+`"library": {"reused": true}` and nothing reaches YouTube, the worker or a speech-to-text
+service. A YouTube text kept without timestamps is fetched again when timestamps are asked
+for. To fetch a kept video anew, delete it with `library_delete` first. Playlists, searches
+and accounts are fetched as before; the worker already keeps each video once, for every
+caller. Saving the same text again writes nothing. Every answer that kept something says so
+in its `library` field. When the library cannot be reached, the transcript still comes back and the
 `library` field says it was not kept.
 
 Each customer has a database of its own: one SQLite Durable Object on Cloudflare per

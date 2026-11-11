@@ -120,6 +120,14 @@ const SCHEMA = [
     + ' insert into item_fts(rowid, title, author, text) values (new.id, new.title, new.author, new.text); end',
   'create table if not exists usage_day (day text primary key, requests integer not null)',
 ];
+// Added after the first deploy; databases made before get them in schema().
+const ADDED = [
+  ['sha', 'alter table item add column sha text'],
+];
+const INDEXES = ['create index if not exists item_external on item (platform, external_id)'];
+// How often the day's request count is written: counting every request would
+// itself be a row written per request, reads included.
+const COUNT_EVERY = 50;
 
 const LIST_COLUMNS = 'id, url, platform, kind, external_id, title, author, published_at, duration_seconds, language,'
   + ' length(text) as characters, created_at, updated_at';
@@ -135,10 +143,19 @@ export class Library {
 
   schema() {
     for (const statement of SCHEMA) this.ctx.storage.sql.exec(statement);
+    const columns = this.ctx.storage.sql.exec("select name from pragma_table_info('item')").toArray().map((c) => c.name);
+    for (const [column, statement] of ADDED) if (!columns.includes(column)) this.ctx.storage.sql.exec(statement);
+    for (const statement of INDEXES) this.ctx.storage.sql.exec(statement);
+    this.day = null;
   }
 
+  // Every query goes through here, so the rows it wrote (what Cloudflare bills)
+  // can be counted per request.
   rows(query, ...bindings) {
-    return this.ctx.storage.sql.exec(query, ...bindings.map((b) => (b === undefined ? null : b))).toArray();
+    const cursor = this.ctx.storage.sql.exec(query, ...bindings.map((b) => (b === undefined ? null : b)));
+    const out = cursor.toArray();
+    this.written = (this.written || 0) + (cursor.rowsWritten || 0);
+    return out;
   }
 
   async fetch(request) {
@@ -180,19 +197,34 @@ export class Library {
     if (!m || !account || account.revoked_at || !sameText(await sha256(m[2]), account.hash)) {
       return fail(401, 'missing, unknown or revoked library key');
     }
-    const day = now().slice(0, 10);
-    this.rows('insert into usage_day (day, requests) values (?, 1) on conflict(day) do update set requests = requests + 1', day);
-    const [{ requests }] = this.rows('select requests from usage_day where day = ?', day);
+    const requests = this.count();
     if (requests > this.limits.dailyRequests) {
       return fail(429, `more than ${this.limits.dailyRequests} requests today; the limit resets at 00:00 UTC`);
     }
     return null;
   }
 
+  // The day's requests, counted in memory and written every COUNT_EVERY
+  // requests. An object Cloudflare evicts loses at most COUNT_EVERY - 1 of them.
+  count() {
+    const day = now().slice(0, 10);
+    if (this.day !== day) {
+      const [stored] = this.rows('select requests from usage_day where day = ?', day);
+      this.day = day;
+      this.requests = stored?.requests || 0;
+    }
+    this.requests += 1;
+    if (this.requests % COUNT_EVERY === 0) {
+      this.rows('insert into usage_day (day, requests) values (?, ?) on conflict(day) do update set requests = excluded.requests',
+        day, this.requests);
+    }
+    return this.requests;
+  }
+
   async route(request, url) {
     const p = url.searchParams;
     const method = request.method;
-    if (method === 'POST' && url.pathname === '/v1/items') return this.save(await readJson(request));
+    if (method === 'POST' && url.pathname === '/v1/items') return await this.save(await readJson(request));
     if (method === 'GET' && url.pathname === '/v1/items') return this.list(p);
     if (url.pathname === '/v1/item' && (method === 'GET' || method === 'DELETE')) return this.one(p, method === 'DELETE');
     if (method === 'GET' && url.pathname === '/v1/search') return this.search(p);
@@ -200,36 +232,42 @@ export class Library {
     return fail(404, 'no such route');
   }
 
-  save(body) {
+  async save(body) {
     const raw = Array.isArray(body.items) ? body.items : [];
     if (!raw.length || raw.length > MAX_BATCH) return fail(400, `items: 1 to ${MAX_BATCH} per request`);
+    this.written = 0;
     const saved = [];
     const rejected = [];
     for (const entry of raw) {
       const { item, url, reason } = normalize(entry, this.limits.itemBytes);
       if (!item) { rejected.push({ url: url || null, reason }); continue; }
+      const { bytes, ...content } = item;
+      const sha = await sha256(JSON.stringify(content));
       const outcome = this.ctx.storage.transactionSync(() => {
+        const [old] = this.rows('select id, bytes, sha from item where url = ?', item.url);
+        // The same text again: nothing to write, nothing billed.
+        if (old && old.sha === sha) return { id: old.id, created: false, unchanged: true };
         const [{ total }] = this.rows('select coalesce(sum(bytes), 0) as total from item');
-        const [old] = this.rows('select id, bytes from item where url = ?', item.url);
         if (total - (old?.bytes || 0) + item.bytes > this.limits.customerBytes) return { reason: 'the library is full' };
         const stamp = now();
         this.rows(
           'insert into item (url, platform, kind, external_id, title, author, published_at, duration_seconds, language,'
-          + ' text, segments, meta, bytes, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          + ' text, segments, meta, bytes, sha, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
           + ' on conflict(url) do update set platform = excluded.platform, kind = excluded.kind, external_id = excluded.external_id,'
           + ' title = excluded.title, author = excluded.author, published_at = excluded.published_at,'
           + ' duration_seconds = excluded.duration_seconds, language = excluded.language, text = excluded.text,'
-          + ' segments = excluded.segments, meta = excluded.meta, bytes = excluded.bytes, updated_at = excluded.updated_at',
+          + ' segments = excluded.segments, meta = excluded.meta, bytes = excluded.bytes, sha = excluded.sha,'
+          + ' updated_at = excluded.updated_at',
           item.url, item.platform, item.kind, item.external_id, item.title, item.author, item.published_at,
-          item.duration_seconds, item.language, item.text, item.segments, item.meta, item.bytes, stamp, stamp,
+          item.duration_seconds, item.language, item.text, item.segments, item.meta, item.bytes, sha, stamp, stamp,
         );
         const [{ id }] = this.rows('select id from item where url = ?', item.url);
         return { id, created: !old };
       });
       if (outcome.reason) rejected.push({ url: item.url, reason: outcome.reason });
-      else saved.push({ id: outcome.id, url: item.url, created: outcome.created });
+      else saved.push({ id: outcome.id, url: item.url, created: outcome.created, ...(outcome.unchanged ? { unchanged: true } : {}) });
     }
-    return json(200, { saved, rejected });
+    return json(200, { saved, rejected, rows_written: this.written });
   }
 
   list(p) {
@@ -247,14 +285,20 @@ export class Library {
   one(p, remove) {
     const id = Number(p.get('id')) || null;
     const link = p.get('url');
-    if (!id && !link) return fail(400, 'id or url is required');
-    const [item] = this.rows('select * from item where (? is not null and id = ?) or (? is not null and url = ?)', id, id, link, link);
+    const platform = p.get('platform');
+    const external = p.get('external_id');
+    if (!id && !link && !(platform && external)) return fail(400, 'id, url, or platform with external_id is required');
+    const [item] = this.rows(
+      'select * from item where (? is not null and id = ?) or (? is not null and url = ?)'
+      + ' or (? is not null and ? is not null and platform = ? and external_id = ?) order by updated_at desc limit 1',
+      id, id, link, link, platform, external, platform, external,
+    );
     if (!item) return fail(404, 'no such item');
     if (remove) {
       this.rows('delete from item where id = ?', item.id);
       return json(200, { deleted: { id: item.id, url: item.url } });
     }
-    const { bytes, segments, meta, ...rest } = item;
+    const { bytes, sha, segments, meta, ...rest } = item;
     return json(200, { ...rest, segments: segments ? JSON.parse(segments) : [], meta: meta ? JSON.parse(meta) : {} });
   }
 
@@ -275,7 +319,7 @@ export class Library {
     const [{ items, bytes }] = this.rows('select count(*) as items, coalesce(sum(bytes), 0) as bytes from item');
     const [today] = this.rows('select requests from usage_day where day = ?', now().slice(0, 10));
     return json(200, {
-      items, bytes, requests_today: today?.requests || 0,
+      items, bytes, database_bytes: this.ctx.storage.sql.databaseSize ?? null, requests_today: this.day === now().slice(0, 10) ? this.requests : (today?.requests || 0),
       limits: { customer_bytes: this.limits.customerBytes, item_bytes: this.limits.itemBytes, daily_requests: this.limits.dailyRequests },
     });
   }
