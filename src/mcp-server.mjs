@@ -7,8 +7,9 @@ import { BlockedError, getTranscript, getTranscripts, parsePlaylistId, parseVide
 import { configuredProxy, readConfig } from './config.mjs';
 import { dockerAvailable, rotate as rotateWarp, start as startWarp } from './warp.mjs';
 import { IMAGE_BLOCKS, imagesTool, runImagesTool, runSocialTool, socialTool } from './social.mjs';
+import { keeping, libraryFromEnv, libraryTools, youtubeRecord } from './library.mjs';
 
-export const VERSION = '3.2.1';
+export const VERSION = '3.3.0';
 const PROTOCOL = '2025-06-18';
 const DELAY_MS = Number(process.env.YOUTUBE_TRANSCRIPT_DELAY_MS || 1000);
 const CONCURRENCY = Number(process.env.YOUTUBE_TRANSCRIPT_CONCURRENCY || 3);
@@ -154,7 +155,7 @@ const resolveDir = (dir) => (isAbsolute(dir) ? dir : resolve(process.cwd(), dir)
 // Fetches many transcripts and writes each one to <dir>/<videoId>.txt as soon as
 // it arrives, so a run that dies late has still delivered what it got. Returns
 // the run's summary with an index in place of the transcripts themselves.
-export async function saveTranscripts(videoIds, { dir, route, onBlocked, language, notify = () => {}, fetcher }) {
+export async function saveTranscripts(videoIds, { dir, route, onBlocked, language, notify = () => {}, fetcher, keep }) {
   await mkdir(dir, { recursive: true });
   notify(`${videoIds.length} videos, saving to ${dir}`);
 
@@ -170,6 +171,7 @@ export async function saveTranscripts(videoIds, { dir, route, onBlocked, languag
     onProgress: (done, total, videoId) => notify(`transcript ${done}/${total} (${videoId})`, done, total),
     onVideo: async (video, position) => {
       if (video.skipped) return void (index[position] = video);
+      keep?.(youtubeRecord(video));
       await writeFile(join(dir, `${video.videoId}.txt`), `${video.fullText}\n`);
       // What Claude needs to pick from: the text itself stays in the file, and the
       // link, channel ID and file name follow from the video ID.
@@ -185,7 +187,7 @@ export async function saveTranscripts(videoIds, { dir, route, onBlocked, languag
 // back in the answer, in batches, until about `budget` characters are in. The
 // videos that were not reached are left for a second call, which starts at
 // `nextOffset`.
-export async function collectTranscripts(videoIds, { route, onBlocked, language, notify = () => {}, fetcher, budget = INLINE_CHARS, offset = 0 }) {
+export async function collectTranscripts(videoIds, { route, onBlocked, language, notify = () => {}, fetcher, budget = INLINE_CHARS, offset = 0, keep }) {
   const videos = [];
   let characters = 0;
   let next = 0;
@@ -206,6 +208,7 @@ export async function collectTranscripts(videoIds, { route, onBlocked, language,
     }
     for (const video of part.videos) {
       if (video.skipped) { videos.push(video); continue; }
+      keep?.(youtubeRecord(video));
       const { segments, availableLanguages, channelId, url, totalSegments, ...meta } = video;
       characters += video.fullText.length;
       videos.push(meta);
@@ -234,7 +237,9 @@ export async function runTool(args, { notify = () => {} } = {}, deps = {}) {
   if (type === 'video') {
     const videoId = parseVideoId(input);
     if (!videoId) throw new Error(`No YouTube video ID in "${input}". Use url_type "playlist" or "search" for those.`);
-    return withRoute((route) => getTranscript(videoId, { proxy: route.proxy, language, includeSegments: args.include_segments ?? true }), { notify }, deps);
+    const video = await withRoute((route) => getTranscript(videoId, { proxy: route.proxy, language, includeSegments: args.include_segments ?? true }), { notify }, deps);
+    deps.keep?.(youtubeRecord(video));
+    return video;
   }
 
   const inline = outputMode(deps) === 'inline';
@@ -251,8 +256,8 @@ export async function runTool(args, { notify = () => {} } = {}, deps = {}) {
     }
     const videoIds = list.ids;
     if (!videoIds.length) throw new Error(`Nothing at offset ${offset}: the ${type} lists ${list.total} videos.`);
-    if (inline) return collectTranscripts(videoIds, { route, onBlocked, language, notify, fetcher: deps.fetcher, budget: deps.budget, offset });
-    const summary = await saveTranscripts(videoIds, { dir, route, onBlocked, language, notify, fetcher: deps.fetcher });
+    if (inline) return collectTranscripts(videoIds, { route, onBlocked, language, notify, fetcher: deps.fetcher, budget: deps.budget, offset, keep: deps.keep });
+    const summary = await saveTranscripts(videoIds, { dir, route, onBlocked, language, notify, fetcher: deps.fetcher, keep: deps.keep });
     if (route.warpProblem && summary.stoppedEarly) {
       summary.hint = `${route.warpProblem}. Start Docker and try again, or set YOUTUBE_TRANSCRIPT_PROXY.`;
     }
@@ -263,13 +268,16 @@ export async function runTool(args, { notify = () => {} } = {}, deps = {}) {
 // The TikTok/Instagram/Vimeo tools need a worker: Docker on this machine, or one
 // named in SMTRANSCRIPT_WORKER_URL. A server elsewhere (inline mode) without one
 // would only offer tools that always fail, so it does not offer them.
-export function tools(env = process.env) {
+// With a library (SMTRANSCRIPT_LIBRARY_URL and _KEY), every tool keeps what it
+// fetched there, and the library's own tools come along.
+export function tools(env = process.env, library = libraryFromEnv(env)) {
   const list = [{ tool: toolFor(), run: runTool }];
   if (outputMode() !== 'inline' || env.SMTRANSCRIPT_WORKER_URL) {
     list.push({ tool: socialTool(outputMode()), run: runSocialTool });
     list.push({ tool: imagesTool(outputMode()), run: runImagesTool });
   }
-  return list;
+  if (!library) return list;
+  return [...list.map(({ tool, run }) => ({ tool, run: keeping(run, library) })), ...libraryTools(library)];
 }
 
 // ---------------------------------------------------------------------------

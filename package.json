@@ -1,6 +1,6 @@
 {
   "name": "smtranscript",
-  "version": "3.2.1",
+  "version": "3.3.0",
   "description": "MCP server for transcripts: YouTube (one video, a playlist, search results; no API key, Cloudflare WARP for bulk) TikTok and Instagram (videos and accounts, transcribed with Whisper in a Docker worker), Vimeo videos (captions first) and the pictures of Instagram posts.",
   "type": "module",
   "bin": {

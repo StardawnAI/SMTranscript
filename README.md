@@ -186,6 +186,37 @@ Such a server offers `get_social_transcript` and `get_instagram_images` only whe
 a worker to use (`SMTRANSCRIPT_WORKER_URL`, see below). Inline, `get_instagram_images` attaches
 the pictures themselves to the answer as MCP image content (up to 10), so a model can look at them.
 
+## Your text library
+
+With a library key, every transcript and post text the tools fetch is kept as text in your
+own database, and four more tools work with it:
+
+| Tool | What it does |
+| --- | --- |
+| `library_search` | Finds kept texts by words (word beginnings, accents ignored, all words must occur), with a snippet |
+| `library_list` | What is kept, newest first: link, platform, author, title, date, length; pages with `before` |
+| `library_get` | One kept text in full, with its timed segments, by id or link |
+| `library_delete` | Deletes one kept text, by id or link |
+
+Set two variables where the server starts:
+
+| Variable | Value |
+| --- | --- |
+| `SMTRANSCRIPT_LIBRARY_URL` | `https://smtranscript-library.jim-presting.workers.dev` |
+| `SMTRANSCRIPT_LIBRARY_KEY` | Your key, `sml_...`, from the operator |
+
+What is kept: the link, platform, author, title, date, duration, language, the text with its
+timed segments, and for a picture post its caption and the text read off its pictures.
+Pictures, picture links and videos are never kept. Fetching the same link again replaces
+its text instead of keeping it twice. Every answer that kept something says so in its
+`library` field. When the library cannot be reached, the transcript still comes back and the
+`library` field says it was not kept.
+
+Each customer has a database of its own: one SQLite Durable Object on Cloudflare per
+customer, which only that customer's key opens. The service is in [`library/`](library/);
+[`library/README.md`](library/README.md) covers its API, its limits and how customers are
+created.
+
 ## TikTok, Instagram and Vimeo
 
 `get_social_transcript` takes a TikTok, Instagram or Vimeo link:
