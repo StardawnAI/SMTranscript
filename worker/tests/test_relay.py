@@ -10,7 +10,10 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from smt.engine import Engine
 from smt.errors import JobError
-from smt.relay import RemoteAsr, select_source
+import shutil
+import subprocess
+import urllib.error
+from smt.relay import HEAD_BYTES, TAIL_BYTES, RemoteAsr, head_duration, select_source
 from test_worker import FakeFetch, settings, TT
 
 
@@ -86,6 +89,76 @@ class RelayTest(unittest.TestCase):
                 with self.assertRaises(JobError):
                     client.transcribe(select_source(info()), "a" * 64, None)
                 self.assertEqual(call.call_count, 1)
+
+
+class DurationAndBudgetTest(unittest.TestCase):
+    def test_a_missing_duration_is_read_from_the_file_head(self):
+        asked = []
+        data = info()
+        data.pop("duration")
+        source = select_source(data, lambda url, headers: asked.append((url, headers)) or 41.5)
+        self.assertEqual(source["duration"], 41.5)
+        self.assertEqual(asked, [("https://video.cdninstagram.com/audio.m4a", {})])
+
+    def test_a_duration_nobody_knows_stops_before_any_paid_call(self):
+        data = info()
+        data.pop("duration")
+        with self.assertRaises(JobError) as caught:
+            select_source(data, lambda url, headers: 0.0)
+        self.assertEqual(caught.exception.cls, "too_large")
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+    def test_only_the_head_or_the_tail_is_fetched_and_it_tells_the_duration(self):
+        for faststart in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                clip = Path(tmp) / "clip.m4a"
+                subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=95",
+                                "-c:a", "aac", "-b:a", "48k", *(["-movflags", "+faststart"] if faststart else []),
+                                str(clip)], check=True)
+                whole = clip.read_bytes()
+            self.assertGreater(len(whole), HEAD_BYTES + TAIL_BYTES, "the clip must be longer than head and tail")
+            ranges = []
+
+            class Opener:
+                def open(self, request, timeout):
+                    wanted = request.get_header("Range")
+                    ranges.append(wanted)
+                    body = whole[-TAIL_BYTES:] if wanted.startswith("bytes=-") else whole[:HEAD_BYTES]
+
+                    class Response:
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *exc):
+                            return False
+
+                        def read(self, n):
+                            return body[:n]
+                    return Response()
+
+            seconds = head_duration("https://video.cdninstagram.com/a.m4a", {"User-Agent": "UA"}, opener=Opener())
+            self.assertAlmostEqual(seconds, 95, delta=1, msg=f"faststart={faststart}")
+            expected = [f"bytes=0-{HEAD_BYTES - 1}"] + ([] if faststart else [f"bytes=-{TAIL_BYTES}"])
+            self.assertEqual(ranges, expected, f"faststart={faststart}")
+
+    def test_an_unreachable_head_answers_zero(self):
+        class Opener:
+            def open(self, request, timeout):
+                raise OSError("Network is unreachable")
+        self.assertEqual(head_duration("https://video.cdninstagram.com/a.m4a", {}, opener=Opener()), 0.0)
+
+    def test_a_used_up_budget_waits_for_the_next_day_instead_of_failing(self):
+        with patch.dict(os.environ, {"SMT_TRANSCRIPT_RELAY_URL": "https://relay.example",
+             "SMT_TRANSCRIPT_RELAY_TOKEN": "test-token", "SMT_GROQ_API_KEY": "gsk_test"}):
+            client = RemoteAsr.from_env()
+            refused = urllib.error.HTTPError("https://relay.example/v1/transcribe", 429, "Too Many Requests", {}, None)
+            refused.read = lambda n=None: b'{"error": "Daily transcription budget reached.", "budget_alert": true}'
+            with patch("smt.relay.urllib.request.urlopen", side_effect=refused):
+                with self.assertRaises(JobError) as caught:
+                    client.transcribe(select_source(info()), "a" * 64, None)
+        self.assertEqual(caught.exception.cls, "rate_limited")
+        self.assertGreater(caught.exception.retry_after, 60)
+        self.assertLessEqual(caught.exception.retry_after, 86400 + 60)
 
 
 if __name__ == "__main__":

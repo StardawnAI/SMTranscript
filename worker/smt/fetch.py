@@ -156,12 +156,16 @@ class Session:
     def remote_source(self, info: dict) -> dict:
         """Pass only a media URL and its scoped session headers to the relay."""
         import urllib.request
-        from .relay import select_source
-        source = select_source(info)
-        request = urllib.request.Request(source["url"])
-        self._ydl.cookiejar.add_cookie_header(request)
-        if request.has_header("Cookie"):
-            source["headers"]["Cookie"] = request.get_header("Cookie")
+        from .relay import head_duration, select_source
+
+        def with_cookie(url: str, headers: dict) -> dict:
+            request = urllib.request.Request(url)
+            self._ydl.cookiejar.add_cookie_header(request)
+            return {**headers, **({"Cookie": request.get_header("Cookie")} if request.has_header("Cookie") else {})}
+
+        source = select_source(info, lambda url, headers: head_duration(
+            url, with_cookie(url, headers), self._ydl.params.get("proxy")))
+        source["headers"] = with_cookie(source["url"], source["headers"])
         return source
 
     def download(self, info: dict, tmp: Path, captions_only: bool = False) -> dict:
