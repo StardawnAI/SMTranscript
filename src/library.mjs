@@ -4,6 +4,7 @@
 // list, read and delete it. Without them the server works as before.
 // Pictures and videos are never sent: only words.
 
+import { libraryIdOf } from './caller.mjs';
 import { parseVideoId } from './youtube.mjs';
 
 const BATCH_ITEMS = 20;
@@ -12,16 +13,50 @@ const BATCH_BYTES = 4 * 1024 * 1024;
 export function libraryFromEnv(env = process.env, fetchImpl = fetch) {
   const url = String(env.SMTRANSCRIPT_LIBRARY_URL || '').trim().replace(/\/$/, '');
   const key = String(env.SMTRANSCRIPT_LIBRARY_KEY || '').trim();
+  const operator = String(env.SMTRANSCRIPT_LIBRARY_OPERATOR_TOKEN || '').trim();
+  if (url && operator) {
+    // A server for many people (the AWG hub): one library per caller, opened
+    // with the operator's token. SMTRANSCRIPT_LIBRARY_MEMBERS can give a caller
+    // a library that exists already ({"<caller id>": "<library id>"}). A call
+    // that names nobody has no library: there is no shared one.
+    let members;
+    try {
+      members = JSON.parse(env.SMTRANSCRIPT_LIBRARY_MEMBERS || '{}') || {};
+    } catch {
+      throw new Error('SMTRANSCRIPT_LIBRARY_MEMBERS is not JSON: {"<caller id>": "<library id>"}');
+    }
+    return {
+      perCaller: true,
+      member(caller) {
+        const id = libraryIdOf(caller, members);
+        if (!id) return null;
+        const name = `AWG hub user ${caller.id}`.replace(/[^ -~]/g, '?').slice(0, 200);
+        return libraryClient({ url, key: operator, headers: { 'x-library-customer': id, 'x-library-name': name } }, fetchImpl);
+      },
+    };
+  }
   return url && key ? libraryClient({ url, key }, fetchImpl) : null;
 }
 
+// What the library tools answer where libraries are kept per person and a call
+// names nobody.
+const NOBODY = 'The library is kept per AWG user, and this call names none.';
+export const noLibrary = {
+  save: async () => { throw new Error(NOBODY); },
+  search: async () => { throw new Error(NOBODY); },
+  list: async () => { throw new Error(NOBODY); },
+  get: async () => { throw new Error(NOBODY); },
+  remove: async () => { throw new Error(NOBODY); },
+  usage: async () => { throw new Error(NOBODY); },
+};
+
 const query = (params) => new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')).toString();
 
-export function libraryClient({ url, key }, fetchImpl = fetch) {
+export function libraryClient({ url, key, headers = {} }, fetchImpl = fetch) {
   const call = async (method, path, body) => {
     const r = await fetchImpl(`${url}${path}`, {
       method,
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', ...headers },
       ...(body ? { body: JSON.stringify(body) } : {}),
       signal: AbortSignal.timeout(30000),
     });

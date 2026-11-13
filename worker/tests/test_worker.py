@@ -386,6 +386,24 @@ class EngineTest(unittest.TestCase):
         with self.assertRaises(JobError):
             self.engine.submit_video("alice", "https://www.tiktok.com/@someone")
 
+    def test_a_member_is_kept_but_is_not_part_of_the_key(self):
+        a, _ = self.engine.submit_video("awghub", TT, {"member": "user:ann"})
+        b, existing = self.engine.submit_video("awghub", TT, {"member": "user:bob"})
+        self.assertEqual((b["id"], existing), (a["id"], True))
+        self.assertEqual(self.job(a["id"])["member"], "user:ann")
+        for bad in ("ann bob", "../x", "x" * 121, 7):
+            with self.assertRaises(JobError):
+                self.engine.submit_video("awghub", TT, {"member": bad})
+
+    def test_the_videos_of_an_account_run_for_the_member_who_asked(self):
+        self.fake.profile_items = [{"id": "5", "url": "https://www.tiktok.com/@someone/video/5",
+                                    "taken_at": dt.datetime(2026, 10, 29, tzinfo=dt.timezone.utc)}]
+        job, _ = self.engine.submit_profile("awghub", "https://www.tiktok.com/@someone",
+                                            {"max_items": 1, "member": "user:ann"})
+        self.drain()
+        children = self.engine.db.all("select member from job where parent_id = ?", (job["id"],))
+        self.assertEqual([c["member"] for c in children], ["user:ann"])
+
     # -- the whole way ----------------------------------------------------
 
     def test_video_then_asr(self):

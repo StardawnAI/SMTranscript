@@ -208,3 +208,75 @@ test('deleting frees room in a full library, and an erased customer stays empty'
   const db = env.LIBRARY.get(a.customer).ctx.storage.db;
   assert.equal(db.prepare('select count(*) as n from sqlite_master').get().n, 0);
 });
+
+// The operator: the AWG hub keeps one library per hub user with one token.
+const OPERATOR = 'o'.repeat(40);
+async function asOperator(env, method, path, { customer, name, token = OPERATOR, body, key } = {}) {
+  const r = await worker.fetch(new Request(`https://library.test${path}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${key ?? token}`,
+      'content-type': 'application/json',
+      ...(customer ? { 'x-library-customer': customer } : {}),
+      ...(name ? { 'x-library-name': name } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  }), env);
+  return { status: r.status, data: await r.json() };
+}
+const operatorEnv = async (vars = {}) => {
+  const { createHash } = await import('node:crypto');
+  return stack({ OPERATOR_TOKEN_SHA256: createHash('sha256').update(OPERATOR).digest('hex'), ...vars });
+};
+
+test('the operator keeps a library per member, made on first use and listed for the admin', async () => {
+  const { env, call } = await operatorEnv();
+  const ann = 'annannannannann1';
+  const bob = 'bobbobbobbobbob2';
+  assert.equal((await asOperator(env, 'GET', '/v1/items', { customer: ann, name: 'hub user Ann' })).data.items.length, 0);
+  await asOperator(env, 'POST', '/v1/items', { customer: ann, body: { items: [reel(1, 'Die Grunderwerbsteuer in Bayern')] } });
+  assert.equal((await asOperator(env, 'GET', '/v1/search?q=Grunderwerbsteuer', { customer: ann })).data.results.length, 1);
+  assert.equal((await asOperator(env, 'GET', '/v1/search?q=Grunderwerbsteuer', { customer: bob })).data.results.length, 0,
+    'another member sees nothing of it');
+  const listed = (await call('GET', '/v1/admin/customers', { key: env.ADMIN_TOKEN })).data.customers.map((c) => [c.id, c.name]);
+  assert.deepEqual(listed, [[ann, 'hub user Ann'], [bob, `member ${bob}`]]);
+});
+
+test('the operator reaches a customer the admin made, so a hub user can keep an existing library', async () => {
+  const { env, call, customer } = await operatorEnv();
+  const a = await customer('Kunde A');
+  await call('POST', '/v1/items', { key: a.key, body: { items: [reel(1, 'Notarkosten beim Hauskauf')] } });
+  assert.equal((await asOperator(env, 'GET', '/v1/search?q=Notarkosten', { customer: a.customer })).data.results.length, 1);
+});
+
+test('the operator path is closed without the right token, without a library name, and when no operator is set', async () => {
+  const { env } = await operatorEnv();
+  assert.equal((await asOperator(env, 'GET', '/v1/items', { customer: 'annannannannann1', token: 'x'.repeat(40) })).status, 401);
+  assert.equal((await asOperator(env, 'GET', '/v1/items', {})).status, 400);
+  assert.equal((await asOperator(env, 'GET', '/v1/items', { customer: '../../etc/passwd' })).status, 400);
+  const none = stack();
+  assert.equal((await asOperator(none.env, 'GET', '/v1/items', { customer: 'annannannannann1' })).status, 401);
+});
+
+test('a caller cannot claim the operator path with its own header', async () => {
+  const { env, customer } = await operatorEnv();
+  const a = await customer('Kunde A');
+  const forged = await worker.fetch(new Request('https://library.test/v1/items', {
+    headers: { authorization: `Bearer sml_annannannannann1_${'0'.repeat(48)}`, 'x-library-via': 'operator',
+      'x-library-customer': 'annannannannann1' },
+  }), env);
+  assert.equal(forged.status, 401, 'a made-up key with the header stays refused');
+  const db = env.LIBRARY.get('annannannannann1').ctx.storage.db;
+  assert.equal(db.prepare('select count(*) as n from sqlite_master').get().n, 0, 'and nothing was made');
+  assert.ok(a.key);
+});
+
+test('a revoked member stays refused; an erased one starts empty', async () => {
+  const { env, call } = await operatorEnv();
+  const ann = 'annannannannann1';
+  await asOperator(env, 'POST', '/v1/items', { customer: ann, body: { items: [reel(1, 'Mietrecht')] } });
+  await call('DELETE', `/v1/admin/customers/${ann}`, { key: env.ADMIN_TOKEN });
+  assert.equal((await asOperator(env, 'GET', '/v1/items', { customer: ann })).status, 401);
+  await call('DELETE', `/v1/admin/customers/${ann}?erase=true`, { key: env.ADMIN_TOKEN });
+  assert.equal((await asOperator(env, 'GET', '/v1/items', { customer: ann })).data.items.length, 0);
+});

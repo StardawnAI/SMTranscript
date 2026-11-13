@@ -39,6 +39,7 @@ create table if not exists job (
     media_id        integer,
     platform_requests integer not null default 0,
     priority        integer not null default 0, -- 1: someone is waiting for it (an MCP call)
+    member          text,                       -- the caller's own user it ran for (a hub user), or null
     created_at      real not null,
     updated_at      real not null,
     finished_at     real,
@@ -126,8 +127,12 @@ class Db:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn.executescript(SCHEMA)
         # Databases from before 1.2.0 lack the column; create table if not exists does not add it.
-        if "priority" not in {r[1] for r in self.conn.execute("pragma table_info(job)")}:
+        columns = {r[1] for r in self.conn.execute("pragma table_info(job)")}
+        if "priority" not in columns:
             self.conn.execute("alter table job add column priority integer not null default 0")
+        # Databases from before 1.6.0 lack the member column.
+        if "member" not in columns:
+            self.conn.execute("alter table job add column member text")
 
     @property
     def conn(self) -> sqlite3.Connection:

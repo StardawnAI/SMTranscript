@@ -16,13 +16,13 @@ Groq's own data retention controls are separate and were not changed here.
 The platform operator configures the worker connection; customers submit a social
 URL through the existing interface and do not need command-line setup.
 
-| Worker setting | Value |
-| --- | --- |
-| `SMT_ASR_MODEL` | `groq:whisper-large-v3-turbo` |
-| `SMT_KEEP_MEDIA` | `0` |
-| `SMT_TRANSCRIPT_RELAY_URL` | The deployed HTTPS relay origin |
-| `SMT_TRANSCRIPT_RELAY_TOKEN` | Relay secret, kept outside the repository |
-| `SMT_GROQ_API_KEY` | Existing Groq key, transmitted over HTTPS but not stored in Cloudflare |
+| Worker setting               | Value                                                                  |
+| ---------------------------- | ---------------------------------------------------------------------- |
+| `SMT_ASR_MODEL`              | `groq:whisper-large-v3-turbo`                                          |
+| `SMT_KEEP_MEDIA`             | `0`                                                                    |
+| `SMT_TRANSCRIPT_RELAY_URL`   | The deployed HTTPS relay origin                                        |
+| `SMT_TRANSCRIPT_RELAY_TOKEN` | Relay secret, kept outside the repository                              |
+| `SMT_GROQ_API_KEY`           | Existing Groq key, transmitted over HTTPS but not stored in Cloudflare |
 
 The Cloudflare deployment uses `wrangler.jsonc`, a secret named `RELAY_TOKEN` and
 the SQLite Durable Object binding `BUDGET`. A shared global budget serializes
@@ -31,6 +31,11 @@ half-budget warning returned to the calling job. Each reservation conservatively
 uses the trusted resolver duration plus 30 seconds, USD 0.04 per hour and
 2 EUR per USD. Reservations are not refunded after failures. This is an
 application reservation ceiling, not a verified Groq account billing limit.
+
+A job may name its `member` (`<tenant>:<user>`, for example one user of the AWG
+hub). A member then also spends from a share of their own, `MEMBER_DAILY_EUR_LIMIT`
+(EUR 0.10 per UTC day), beside the day's total, so one user cannot use up everybody's
+day. A video already transcribed costs nobody anything again.
 
 Stable media/model/language identifiers replay completed results without another
 paid call. An interrupted provider call is not automatically repeated. The Groq

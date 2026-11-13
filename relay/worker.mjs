@@ -166,8 +166,17 @@ export class Budget {
       const reserved = Math.ceil(Math.max(input.duration + 30, 10) * 0.04 / 3600 * 2 * 1e6);
       const spent = (await tx.get(`day:${day}`) || 0) + reserved;
       if (spent > Math.floor(limit * 1e6)) return reply({ error: 'Daily transcription budget reached.', budget_alert: true }, 429);
+      // One user of a caller (a hub user) spends from a share of their own beside
+      // the day's total, so one user cannot use up everybody's day.
+      const memberLimit = Number(this.env.MEMBER_DAILY_EUR_LIMIT || '0');
+      const memberKey = input.member && memberLimit > 0 ? `member:${input.member}:${day}` : null;
+      const memberSpent = memberKey ? (await tx.get(memberKey) || 0) + reserved : 0;
+      if (memberKey && memberSpent > Math.floor(memberLimit * 1e6)) {
+        return reply({ error: "This user's daily transcription budget is reached.", member_budget: true }, 429);
+      }
       const budget_alert = spent >= limit * 1e6 / 2;
       await tx.put(`day:${day}`, spent);
+      if (memberKey) await tx.put(memberKey, memberSpent);
       await tx.put(jobKey, { reserved, day, attempts: 1, budget_alert });
       return reply({ reserved_eur: reserved / 1e6, budget_alert });
     });
@@ -187,11 +196,14 @@ export default {
       const input = await boundedJson(request, 24 * 1024);
       const source = validateSource(input.source);
       if (!/^[a-f0-9]{64}$/.test(input.id || '') || !/^gsk_[A-Za-z0-9]+$/.test(request.headers.get('X-Groq-Key') || '') ||
-          (input.language && !/^[a-z]{2,3}$/.test(input.language))) throw fail('Invalid job metadata.');
+          (input.language && !/^[a-z]{2,3}$/.test(input.language)) ||
+          (input.member !== undefined && input.member !== null && !/^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,160}$/.test(input.member))) {
+        throw fail('Invalid job metadata.');
+      }
       const budget = env.BUDGET.get(env.BUDGET.idFromName('global'));
       const call = (path, body) => budget.fetch(`https://budget/${path}`, {
         method: 'POST', body: JSON.stringify(body) });
-      const reservation = await call('reserve', { id: input.id, duration: source.duration });
+      const reservation = await call('reserve', { id: input.id, duration: source.duration, member: input.member || null });
       const record = await reservation.json();
       budgetAlert = record.budget_alert || false;
       if (!reservation.ok) return reply(record, reservation.status);

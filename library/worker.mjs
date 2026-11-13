@@ -213,15 +213,41 @@ export class Library {
   }
 
   async authenticate(request) {
-    const m = KEY.exec(bearer(request));
-    if (!this.ready) return fail(401, 'missing, unknown or revoked library key');
-    const [account] = this.rows('select hash, revoked_at from account where id = 1');
-    if (!m || !account || account.revoked_at || !sameText(await sha256(m[2]), account.hash)) {
-      return fail(401, 'missing, unknown or revoked library key');
+    if (request.headers.get('x-library-via') === 'operator') {
+      const denied = await this.member(request);
+      if (denied) return denied;
+    } else {
+      const m = KEY.exec(bearer(request));
+      if (!this.ready) return fail(401, 'missing, unknown or revoked library key');
+      const [account] = this.rows('select hash, revoked_at from account where id = 1');
+      if (!m || !account || account.revoked_at || !sameText(await sha256(m[2]), account.hash)) {
+        return fail(401, 'missing, unknown or revoked library key');
+      }
     }
     const requests = this.count();
     if (requests > this.limits.dailyRequests) {
       return fail(429, `more than ${this.limits.dailyRequests} requests today; the limit resets at 00:00 UTC`);
+    }
+    return null;
+  }
+
+  // A member of the operator (one user of the AWG hub). The front worker checked
+  // the operator's token and set the x-library-* headers itself. The member's
+  // library is made the first time it is used; no key opens it, because its
+  // hash is of a secret nobody holds. A revoked member stays refused.
+  async member(request) {
+    const id = request.headers.get('x-library-customer');
+    const name = short(request.headers.get('x-library-name'), 200) || `member ${id}`;
+    if (!this.ready) {
+      this.schema();
+      this.ready = true;
+    }
+    const [account] = this.rows('select revoked_at from account where id = 1');
+    if (account?.revoked_at) return fail(401, 'missing, unknown or revoked library key');
+    if (!account) {
+      this.rows('insert into account (id, hash, name, created_at, revoked_at) values (1, ?, ?, ?, null)',
+        await sha256(randomId(48, '0123456789abcdef')), name, now());
+      await internal(this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName('directory')), '/internal/add', { id, name });
     }
     return null;
   }
@@ -365,7 +391,8 @@ export class Directory {
     }
     const body = await readJson(request);
     if (pathname === '/internal/add') {
-      sql.exec('insert into customer (id, name, created_at) values (?, ?, ?)', body.id, short(body.name, 200), now());
+      sql.exec('insert into customer (id, name, created_at) values (?, ?, ?)'
+        + ' on conflict(id) do update set name = excluded.name, revoked_at = null', body.id, short(body.name, 200), now());
       return json(200, { ok: true });
     }
     if (pathname === '/internal/revoke') {
@@ -411,6 +438,20 @@ async function admin(request, env, url) {
   return fail(404, 'no such route');
 }
 
+// The operator (the AWG hub) keeps one library per user of its own with one
+// token: it names the user's library in x-library-customer. The worker knows
+// only the token's SHA-256. Without OPERATOR_TOKEN_SHA256 there is no operator.
+async function operator(request, env, token) {
+  const expected = String(env.OPERATOR_TOKEN_SHA256 || '').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(expected) || token.length < 32 || !sameText(await sha256(token), expected)) {
+    return fail(401, 'missing, unknown or revoked library key');
+  }
+  const id = request.headers.get('x-library-customer') || '';
+  if (!/^[a-z0-9]{16}$/.test(id)) return fail(400, 'x-library-customer must name a library: 16 letters and digits');
+  request.headers.set('x-library-via', 'operator');
+  return env.LIBRARY.get(env.LIBRARY.idFromName(id)).fetch(request);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -418,10 +459,15 @@ export default {
       if (url.pathname === '/healthz') return json(200, { ok: true });
       if (url.pathname.startsWith('/v1/admin/')) return await admin(request, env, url);
       if (url.pathname.startsWith('/v1/')) {
-        const m = KEY.exec(bearer(request));
-        if (!m) return fail(401, 'missing, unknown or revoked library key');
+        const token = bearer(request);
+        const m = KEY.exec(token);
+        // Only this worker says how a request was let in: a caller's own
+        // x-library-via header is dropped.
+        const forwarded = new Request(request);
+        forwarded.headers.delete('x-library-via');
         // The key names the customer's database; that database checks the secret.
-        return await env.LIBRARY.get(env.LIBRARY.idFromName(m[1])).fetch(request);
+        if (m) return await env.LIBRARY.get(env.LIBRARY.idFromName(m[1])).fetch(forwarded);
+        return await operator(forwarded, env, token);
       }
       return fail(404, 'no such route');
     } catch (e) {

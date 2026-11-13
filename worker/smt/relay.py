@@ -119,11 +119,12 @@ class RemoteAsr:
             raise ValueError("SMT_TRANSCRIPT_RELAY_URL must be an HTTPS endpoint without credentials")
         return cls(*values)
 
-    def transcribe(self, source: dict, identity: str, language: str | None) -> dict:
-        payload = json.dumps({"id": identity, "source": source, "language": language}).encode()
+    def transcribe(self, source: dict, identity: str, language: str | None, member: str | None = None) -> dict:
+        payload = json.dumps({"id": identity, "source": source, "language": language,
+                              **({"member": member} if member else {})}).encode()
         request = urllib.request.Request(self.url + "/v1/transcribe", data=payload,
             headers={"Authorization": "Bearer " + self.token, "X-Groq-Key": self.key,
-                     "Content-Type": "application/json", "User-Agent": "SMTranscript/3.3.1"})
+                     "Content-Type": "application/json", "User-Agent": "SMTranscript/3.4.0"})
         try:
             # paid-call: Cloudflare Budget atomically reserves euros across all callers;
             # stable identity prevents a second provider call after an uncertain response.
@@ -142,7 +143,8 @@ class RemoteAsr:
             if exc.code == 429:
                 # The day's euros are spent and nothing was reserved: the job
                 # waits for the next UTC day instead of failing.
-                raise JobError("rate_limited", "the daily transcription budget is used up; "
+                whose = "this user's" if detail.get("member_budget") else "the"
+                raise JobError("rate_limited", f"{whose} daily transcription budget is used up; "
                                "transcription resumes after 00:00 UTC", retry_after=_until_next_utc_day()) from None
             raise JobError("invalid_input", f"Streaming relay returned HTTP {exc.code}; no local media fallback{alert}") from None
         except (OSError, ValueError) as exc:

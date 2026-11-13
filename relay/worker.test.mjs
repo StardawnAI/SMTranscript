@@ -109,3 +109,23 @@ test('failed source requests still expose the half-budget alert', async () => {
     assert.equal((await r.json()).budget_alert, true);
   } finally { globalThis.fetch = previous; }
 });
+test('each user of a caller spends from a daily share of their own beside the total', async () => {
+  const b = new Budget({ storage: storage() }, { DAILY_EUR_LIMIT: '0.05', MEMBER_DAILY_EUR_LIMIT: '0.01' });
+  const reserve = (id, member) => b.fetch(new Request('https://budget/reserve', { method: 'POST',
+    body: JSON.stringify({ id, duration: 300, member }) }));
+  assert.equal((await reserve('a1', 'awghub:ann')).status, 200);
+  const refused = await reserve('a2', 'awghub:ann');
+  assert.equal(refused.status, 429);
+  assert.equal((await refused.json()).member_budget, true);
+  assert.equal((await reserve('b1', 'awghub:bob')).status, 200, 'another user still has their share');
+  assert.equal((await reserve('n1', null)).status, 200, 'a call without a user spends from the total only');
+});
+test('a malformed user name never reaches the budget', async () => {
+  let reached = false;
+  const binding = { idFromName: () => 'global', get: () => ({ fetch: async () => { reached = true; return Response.json({}); } }) };
+  const r = await worker.fetch(new Request('https://relay.test/v1/transcribe', { method: 'POST',
+    headers: { Authorization: 'Bearer test-secret', 'X-Groq-Key': 'gsk_test' },
+    body: JSON.stringify({ id: 'a'.repeat(64), source: source(), member: 'ann bob/../x' }) }), { ...env, BUDGET: binding });
+  assert.equal(r.status, 400);
+  assert.equal(reached, false);
+});

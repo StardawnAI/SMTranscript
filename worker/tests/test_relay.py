@@ -161,5 +161,45 @@ class DurationAndBudgetTest(unittest.TestCase):
         self.assertLessEqual(caught.exception.retry_after, 86400 + 60)
 
 
+class MemberTest(unittest.TestCase):
+    """One user of a caller (a hub user) spends from their own share of the budget."""
+
+    def test_the_relay_is_told_whose_share_pays(self):
+        with tempfile.TemporaryDirectory() as root:
+            engine = Engine(settings(Path(root), keep_media=False, asr_model="groq:whisper-large-v3-turbo"))
+            remote = Mock()
+            remote.transcribe.return_value = {"text": "Hallo", "language": "de",
+                "model": "groq:whisper-large-v3-turbo", "model_revision": None, "params": {},
+                "segments": [{"start_ms": 0, "end_ms": 1000, "text": "Hallo"}],
+                "status": "available", "quality": {"flags": []}}
+            engine.relay = remote
+            session = Mock()
+            session.resolve.return_value = [info()]
+            session.remote_source.return_value = select_source(info())
+            engine.fetch = Mock()
+            engine.fetch.cookie_copy.return_value = None
+            engine.fetch.session.return_value.__enter__ = Mock(return_value=session)
+            engine.fetch.session.return_value.__exit__ = Mock(return_value=False)
+            job, _ = engine.submit_video("awghub", TT, {"member": "user:ann"})
+            again, existing = engine.submit_video("awghub", TT, {"member": "user:bob"})
+            self.assertEqual((again["id"], existing), (job["id"], True), "one video is one job for everybody")
+            engine.run_once(("fetch",))
+            self.assertEqual(remote.transcribe.call_args.args[3], "awghub:user:ann", "the first asker's share pays")
+            engine.db.conn.close()
+
+    def test_the_member_goes_to_the_relay_and_its_own_limit_is_named(self):
+        with patch.dict(os.environ, {"SMT_TRANSCRIPT_RELAY_URL": "https://relay.example",
+             "SMT_TRANSCRIPT_RELAY_TOKEN": "test-token", "SMT_GROQ_API_KEY": "gsk_test"}):
+            client = RemoteAsr.from_env()
+            refused = urllib.error.HTTPError("https://relay.example/v1/transcribe", 429, "Too Many Requests", {}, None)
+            refused.read = lambda n=None: b'{"error": "budget reached", "member_budget": true}'
+            with patch("smt.relay.urllib.request.urlopen", side_effect=refused) as sent:
+                with self.assertRaises(JobError) as caught:
+                    client.transcribe(select_source(info()), "a" * 64, None, "awghub:user:ann")
+        self.assertEqual(json.loads(sent.call_args.args[0].data)["member"], "awghub:user:ann")
+        self.assertEqual(caught.exception.cls, "rate_limited")
+        self.assertIn("this user's daily transcription budget", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

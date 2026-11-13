@@ -70,6 +70,21 @@ def _image_mime(path: Path) -> str:
     return "image/jpeg"
 
 
+MEMBER = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.@\-]{0,119}")
+
+
+def _member(options: dict | None) -> str | None:
+    """Which user of the caller a job runs for (a hub user): it spends from that
+    user's daily share of the transcription budget. Not part of the job's key, so
+    one video is transcribed once for everybody; the first asker's share pays."""
+    value = (options or {}).get("member")
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not MEMBER.fullmatch(value):
+        raise JobError("invalid_input", "member is up to 120 letters, digits and : _ . @ -")
+    return value
+
+
 def _priority(options: dict | None) -> int:
     """"high": a caller is waiting for this one job, so it goes before bulk work."""
     value = (options or {}).get("priority") or "normal"
@@ -163,7 +178,8 @@ class Engine:
         return out
 
     def _insert(self, tenant: str, kind: str, target: guard.Target, url: str, options: dict,
-                idem: str | None, parent: str | None = None, priority: int = 0) -> tuple[dict, bool]:
+                idem: str | None, parent: str | None = None, priority: int = 0,
+                member: str | None = None) -> tuple[dict, bool]:
         route = options["route"] or self.s.default_route[target.platform]
         key = idem or hashlib.sha256(json.dumps(
             {"kind": kind, "url": target.canonical_url, **options}, sort_keys=True).encode()).hexdigest()
@@ -188,11 +204,11 @@ class Engine:
         now = _now()
         self.db.run(
             "insert into job (id, tenant, kind, idem_key, input_url, platform, platform_id, canonical_url, options,"
-            " status, stage, route, parent_id, priority, created_at, updated_at)"
-            " values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?) on conflict (tenant, idem_key) do nothing",
+            " status, stage, route, parent_id, priority, member, created_at, updated_at)"
+            " values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?) on conflict (tenant, idem_key) do nothing",
             (job_id, tenant, kind, key, url, target.platform, target.platform_id if kind != "profile" else None,
              target.canonical_url, json.dumps(options), "profile" if kind == "profile" else "fetch",
-             route, parent, priority, now, now),
+             route, parent, priority, member, now, now),
         )
         job = self.db.one("select * from job where tenant = ? and idem_key = ?", (tenant, key))
         created = job["id"] == job_id
@@ -206,7 +222,7 @@ class Engine:
         if target.kind == "profile":
             raise JobError("invalid_input", "this is an account, not a video — use a profile import")
         return self._insert(tenant, "video", target, url, self._options(options or {}), idem, parent,
-                            _priority(options))
+                            _priority(options), _member(options))
 
     def submit_images(self, tenant: str, url: str, options: dict | None = None, idem: str | None = None,
                       parent: str | None = None) -> tuple[dict, bool]:
@@ -215,7 +231,7 @@ class Engine:
         if target.platform != "instagram" or target.kind != "video":
             raise JobError("invalid_input", "pictures are read from Instagram post links (instagram.com/p/...)")
         return self._insert(tenant, "images", target, url, self._options(options or {}), idem, parent,
-                            _priority(options))
+                            _priority(options), _member(options))
 
     def submit_profile(self, tenant: str, url: str, options: dict | None = None,
                        idem: str | None = None) -> tuple[dict, bool]:
@@ -236,7 +252,8 @@ class Engine:
                     raise JobError("invalid_input", f"{key} is a date like 2026-10-01") from exc
         opts.update(max_items=limit, since=options.get("since"), until=options.get("until"),
                     include_images=bool(options.get("include_images")) and target.platform == "instagram")
-        return self._insert(tenant, "profile", target, url, opts, idem, priority=_priority(options))
+        return self._insert(tenant, "profile", target, url, opts, idem, priority=_priority(options),
+                            member=_member(options))
 
     def cancel(self, job: dict) -> dict:
         if job["status"] not in TERMINAL:
@@ -488,7 +505,8 @@ class Engine:
                         identity = hashlib.sha256(json.dumps([job["tenant"], target.canonical_url,
                             media["part"], opts["asr_model"], opts["language"]]).encode()).hexdigest()
                         with self.routes.request(platform, route):
-                            result = self.relay.transcribe(ses.remote_source(info), identity, opts["language"])
+                            result = self.relay.transcribe(ses.remote_source(info), identity, opts["language"],
+                                                           f"{job['tenant']}:{job['member']}" if job["member"] else None)
                         self._store_asr(media, result)
                         for flag in result["quality"].get("flags", []):
                             self._warn(job["id"], flag)
@@ -834,7 +852,8 @@ class Engine:
             # the same post asked for on its own is the same job.
             wanted = "describe_images" if pictures else "describe_video"
             child, _ = submit(job["tenant"], item["url"],
-                              {**child_opts, **({wanted: opts[wanted]} if opts.get(wanted) else {})},
+                              {**child_opts, **({wanted: opts[wanted]} if opts.get(wanted) else {}),
+                               "member": job["member"]},
                               parent=job["id"])
             items.append({"id": item["id"], "url": item["url"], "job_id": child["id"], "kind": kind,
                           "caption": item.get("caption"), "taken_at": taken.isoformat() if taken else None})

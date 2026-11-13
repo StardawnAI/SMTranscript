@@ -57,6 +57,22 @@ A customer key is `sml_<customer>_<secret>`. The customer part picks the databas
 database holds only the SHA-256 of the secret and checks it. The worker holds only the
 SHA-256 of the admin token (secret `ADMIN_TOKEN_SHA256`).
 
+## One library per hub user (the operator)
+
+A server that serves many people with one SMTranscript process (the AWG hub) does not
+hold one key per person. It holds the operator token (the worker knows only its SHA-256,
+secret `OPERATOR_TOKEN_SHA256`) and names the person's library in `x-library-customer`
+(16 letters and digits) on every request. A library named that way is made the first
+time it is used, appears in the admin's customer list, and has the same limits as any
+other; no customer key opens it. A revoked one stays refused. A caller's own
+`x-library-via` header is dropped, so a customer key cannot pass as the operator.
+
+On the MCP side: `SMTRANSCRIPT_LIBRARY_OPERATOR_TOKEN` instead of `_KEY`. The hub names
+the person on every call in `_meta["stardawn/caller"]`; their library id is the first 16
+hex digits of `sha256("awg-member:<caller id>")`, unless `SMTRANSCRIPT_LIBRARY_MEMBERS`
+(`{"<caller id>": "<library id>"}`) gives them one that exists already. A call that names
+nobody has no library: there is no shared one.
+
 ## API
 
 Customer routes take `Authorization: Bearer sml_...`:

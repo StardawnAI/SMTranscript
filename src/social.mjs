@@ -10,6 +10,7 @@
 //   a profile:  POST /v1/profile-imports -> poll, then one result per video
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { memberOf } from './caller.mjs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -357,7 +358,7 @@ function failure(result) {
   return new Error(`${result.media?.canonical_url || result.job_id}: ${e.class || result.status} — ${e.message || 'no result'}`);
 }
 
-export async function runSocialTool(args, { notify = () => {} } = {}, deps = {}) {
+export async function runSocialTool(args, { notify = () => {}, caller = null } = {}, deps = {}) {
   const input = String(args.url || '').trim();
   if (!input) throw new Error('url is required');
   const link = parseSocialLink(input);
@@ -372,7 +373,10 @@ export async function runSocialTool(args, { notify = () => {} } = {}, deps = {})
   if (route === 'warp') await (deps.ensureWarp || ensureWarp)({ notify });
   const api = deps.api || client(worker);
   // priority "high": somebody waits for this answer, so it goes before a bulk import on the same worker.
-  const options = { route, priority: 'high', ...(args.language ? { language: args.language } : {}), ...(args.asr ? { asr: args.asr } : {}) };
+  // member: whose daily share of the paid transcription this is (a hub user).
+  const member = memberOf(caller);
+  const options = { route, priority: 'high', ...(args.language ? { language: args.language } : {}), ...(args.asr ? { asr: args.asr } : {}),
+    ...(member ? { member } : {}) };
   const wait = { notify, ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}), ...(deps.seconds ? { seconds: deps.seconds } : {}) };
 
   if (type === 'video') {
@@ -384,7 +388,7 @@ export async function runSocialTool(args, { notify = () => {} } = {}, deps = {})
     }
     if (link.platform === 'instagram' && result.status === 'failed' && /no video in (it|this post)/i.test(result.error?.message || '')) {
       // A picture post: what it has is pictures.
-      const pictures = await runImagesTool({ ...args, url: input }, { notify }, deps);
+      const pictures = await runImagesTool({ ...args, url: input }, { notify, caller }, deps);
       return { ...pictures, note: `A picture post, not a video: here are its pictures. ${pictures.note || ''}`.trim() };
     }
     if (result.status === 'failed' || result.status === 'cancelled') throw failure(result);
@@ -461,7 +465,7 @@ export async function runSocialTool(args, { notify = () => {} } = {}, deps = {})
   };
 }
 
-export async function runImagesTool(args, { notify = () => {} } = {}, deps = {}) {
+export async function runImagesTool(args, { notify = () => {}, caller = null } = {}, deps = {}) {
   const input = String(args.url || '').trim();
   if (!input) throw new Error('url is required');
   const link = parseSocialLink(input);
@@ -477,7 +481,9 @@ export async function runImagesTool(args, { notify = () => {} } = {}, deps = {})
   // One job per post and day: picture links expire after some days, and the
   // worker renews them for a new job (the text read off the pictures stays).
   const today = new Date().toISOString().slice(0, 10);
-  const job = await api.submit({ url: input, kind: 'images', route, priority: 'high', idempotency_key: `images:${input}:${today}` });
+  const member = memberOf(caller);
+  const job = await api.submit({ url: input, kind: 'images', route, priority: 'high', idempotency_key: `images:${input}:${today}`,
+    ...(member ? { member } : {}) });
   notify(job.existing ? `${job.job_id}: already known, reusing it` : `${job.job_id}: queued`);
   const wait = { notify, ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}), ...(deps.seconds ? { seconds: deps.seconds } : {}) };
   const result = await waitResult(api, job.job_id, wait);

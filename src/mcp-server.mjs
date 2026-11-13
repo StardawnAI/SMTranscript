@@ -7,9 +7,10 @@ import { BlockedError, getTranscript, getTranscripts, parsePlaylistId, parseVide
 import { configuredProxy, readConfig } from './config.mjs';
 import { dockerAvailable, rotate as rotateWarp, start as startWarp } from './warp.mjs';
 import { IMAGE_BLOCKS, imagesTool, runImagesTool, runSocialTool, socialTool } from './social.mjs';
-import { keeping, libraryFromEnv, libraryTools, youtubeRecord } from './library.mjs';
+import { callerOf } from './caller.mjs';
+import { keeping, libraryFromEnv, libraryTools, noLibrary, youtubeRecord } from './library.mjs';
 
-export const VERSION = '3.3.1';
+export const VERSION = '3.4.0';
 const PROTOCOL = '2025-06-18';
 const DELAY_MS = Number(process.env.YOUTUBE_TRANSCRIPT_DELAY_MS || 1000);
 const CONCURRENCY = Number(process.env.YOUTUBE_TRANSCRIPT_CONCURRENCY || 3);
@@ -270,14 +271,18 @@ export async function runTool(args, { notify = () => {} } = {}, deps = {}) {
 // would only offer tools that always fail, so it does not offer them.
 // With a library (SMTRANSCRIPT_LIBRARY_URL and _KEY), every tool keeps what it
 // fetched there, and the library's own tools come along.
-export function tools(env = process.env, library = libraryFromEnv(env)) {
+// A library kept per caller (the AWG hub) is that caller's; a call that names
+// nobody gets the tools without one, and the library tools say why.
+export function tools(env = process.env, library = libraryFromEnv(env), caller = null) {
   const list = [{ tool: toolFor(), run: runTool }];
   if (outputMode() !== 'inline' || env.SMTRANSCRIPT_WORKER_URL) {
     list.push({ tool: socialTool(outputMode()), run: runSocialTool });
     list.push({ tool: imagesTool(outputMode()), run: runImagesTool });
   }
   if (!library) return list;
-  return [...list.map(({ tool, run }) => ({ tool, run: keeping(run, library, tool.name) })), ...libraryTools(library)];
+  const own = library.perCaller ? library.member(caller) : library;
+  if (!own) return [...list, ...libraryTools(noLibrary)];
+  return [...list.map(({ tool, run }) => ({ tool, run: keeping(run, own, tool.name) })), ...libraryTools(own)];
 }
 
 // ---------------------------------------------------------------------------
@@ -308,9 +313,10 @@ export function serve({ input = process.stdin, output = process.stdout } = {}) {
           params: { progressToken, message, ...(progress !== undefined ? { progress, total } : {}) },
         });
       };
-      const run = tools().find((t) => t.tool.name === params?.name)?.run;
+      const caller = callerOf(params);
+      const run = tools(process.env, undefined, caller).find((t) => t.tool.name === params?.name)?.run;
       if (!run) throw new Error(`Unknown tool: ${params?.name}`);
-      const result = await run(params.arguments || {}, { notify });
+      const result = await run(params.arguments || {}, { notify, caller });
       // Pictures go along as image content; JSON.stringify leaves the symbol key out.
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }, ...(result?.[IMAGE_BLOCKS] || [])] };
     },
