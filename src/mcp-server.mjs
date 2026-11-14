@@ -8,9 +8,9 @@ import { configuredProxy, readConfig } from './config.mjs';
 import { dockerAvailable, rotate as rotateWarp, start as startWarp } from './warp.mjs';
 import { IMAGE_BLOCKS, imagesTool, runImagesTool, runSocialTool, socialTool } from './social.mjs';
 import { callerOf } from './caller.mjs';
-import { keeping, libraryFromEnv, libraryTools, noLibrary, youtubeRecord } from './library.mjs';
+import { FOLDER_ARG, keeping, libraryFromEnv, libraryTools, noLibrary, youtubeRecord } from './library.mjs';
 
-export const VERSION = '3.5.1';
+export const VERSION = '3.6.0';
 const PROTOCOL = '2025-06-18';
 const DELAY_MS = Number(process.env.YOUTUBE_TRANSCRIPT_DELAY_MS || 1000);
 const CONCURRENCY = Number(process.env.YOUTUBE_TRANSCRIPT_CONCURRENCY || 3);
@@ -280,9 +280,12 @@ export function tools(env = process.env, library = libraryFromEnv(env), caller =
     list.push({ tool: imagesTool(outputMode()), run: runImagesTool });
   }
   if (!library) return list;
+  // With a library, every fetching tool takes the folder to keep its texts in.
+  const withFolder = (tool) => ({ ...tool, inputSchema: { ...tool.inputSchema,
+    properties: { ...tool.inputSchema.properties, folder: FOLDER_ARG } } });
   const own = library.perCaller ? library.member(caller) : library;
   if (!own) return [...list, ...libraryTools(noLibrary)];
-  return [...list.map(({ tool, run }) => ({ tool, run: keeping(run, own, tool.name) })), ...libraryTools(own)];
+  return [...list.map(({ tool, run }) => ({ tool: withFolder(tool), run: keeping(run, own, tool.name) })), ...libraryTools(own)];
 }
 
 // ---------------------------------------------------------------------------

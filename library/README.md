@@ -73,6 +73,17 @@ hex digits of `sha256("awg-member:<caller id>")`, unless `SMTRANSCRIPT_LIBRARY_M
 (`{"<caller id>": "<library id>"}`) gives them one that exists already. A call that names
 nobody has no library: there is no shared one.
 
+## Folders
+
+Every text sits in one folder - what a person calls a group of texts ("Immobilien").
+A text kept without one is in `General`. The fetching tools take `folder`; for an
+account, channel, playlist or search with none named, the model asks first (an existing
+folder, a new one, or General for what is needed only for a while). Asking for a kept
+text into another folder moves it. Names are matched without regard to case, and a
+folder that exists keeps its spelling. `GET /v1/folders` lists them with counts,
+`POST /v1/move {id|url, to}` moves one text, `POST /v1/move {from, to}` renames a
+folder (into an existing one: merged). A move rewrites the row only, not the search index.
+
 ## API
 
 Customer routes take `Authorization: Bearer sml_...`:

@@ -62,6 +62,15 @@ async function readJson(request) {
   }
 }
 
+// A folder name: what a person calls a group of texts ("Immobilien", "General").
+// Trimmed, inner spaces collapsed, no control characters, up to 80 characters.
+export const GENERAL = 'General';
+export function folderName(raw) {
+  if (raw === undefined || raw === null) return null;
+  const name = String(raw).replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  return name || null;
+}
+
 const short = (value, max) => (value === undefined || value === null || value === '' ? null : String(value).slice(0, max));
 
 // One item as it is stored, or the reason it is not.
@@ -90,6 +99,7 @@ export function normalize(raw, itemBytes) {
     text,
     segments: segments ? JSON.stringify(segments) : null,
     meta,
+    folder: folderName(raw.folder),
   };
   item.bytes = utf8(item.text) + utf8(item.segments) + utf8(item.meta) + utf8(item.title) + utf8(item.author) + utf8(url);
   if (item.bytes > itemBytes) return { url, reason: `over ${itemBytes} bytes` };
@@ -115,7 +125,7 @@ const SCHEMA = [
     + ' insert into item_fts(rowid, title, author, text) values (new.id, new.title, new.author, new.text); end',
   'create trigger if not exists item_ad after delete on item begin'
     + " insert into item_fts(item_fts, rowid, title, author, text) values ('delete', old.id, old.title, old.author, old.text); end",
-  'create trigger if not exists item_au after update on item begin'
+  'create trigger if not exists item_au after update of title, author, text on item begin'
     + " insert into item_fts(item_fts, rowid, title, author, text) values ('delete', old.id, old.title, old.author, old.text);"
     + ' insert into item_fts(rowid, title, author, text) values (new.id, new.title, new.author, new.text); end',
   'create table if not exists usage_day (day text primary key, requests integer not null)',
@@ -123,13 +133,17 @@ const SCHEMA = [
 // Added after the first deploy; databases made before get them in schema().
 const ADDED = [
   ['sha', 'alter table item add column sha text'],
+  ['folder', `alter table item add column folder text not null default '${GENERAL}'`],
 ];
-const INDEXES = ['create index if not exists item_external on item (platform, external_id)'];
+const INDEXES = [
+  'create index if not exists item_external on item (platform, external_id)',
+  'create index if not exists item_folder on item (folder collate nocase)',
+];
 // How often the day's request count is written: counting every request would
 // itself be a row written per request, reads included.
 const COUNT_EVERY = 50;
 
-const LIST_COLUMNS = 'id, url, platform, kind, external_id, title, author, published_at, duration_seconds, language,'
+const LIST_COLUMNS = 'id, url, folder, platform, kind, external_id, title, author, published_at, duration_seconds, language,'
   + ' length(text) as characters, created_at, updated_at';
 
 // One customer's database.
@@ -154,6 +168,13 @@ export class Library {
     const columns = this.ctx.storage.sql.exec("select name from pragma_table_info('item')").toArray().map((c) => c.name);
     for (const [column, statement] of ADDED) if (!columns.includes(column)) this.ctx.storage.sql.exec(statement);
     for (const statement of INDEXES) this.ctx.storage.sql.exec(statement);
+    // Libraries from before folders reindexed a text on every change, a move
+    // too; now only a change of its title, author or text does. Once per library.
+    const trigger = this.ctx.storage.sql.exec("select sql from sqlite_master where type = 'trigger' and name = 'item_au'").toArray()[0];
+    if (trigger && !/update of/i.test(trigger.sql)) {
+      this.ctx.storage.sql.exec('drop trigger item_au');
+      this.ctx.storage.sql.exec(SCHEMA.find((x) => x.includes('item_au')));
+    }
     this.day = null;
     this.total = null;
   }
@@ -277,6 +298,8 @@ export class Library {
     if (url.pathname === '/v1/item' && (method === 'GET' || method === 'DELETE')) return this.one(p, method === 'DELETE');
     if (method === 'GET' && url.pathname === '/v1/search') return this.search(p);
     if (method === 'GET' && url.pathname === '/v1/usage') return this.usage();
+    if (method === 'GET' && url.pathname === '/v1/folders') return this.folders();
+    if (method === 'POST' && url.pathname === '/v1/move') return this.move(await readJson(request));
     return fail(404, 'no such route');
   }
 
@@ -289,32 +312,44 @@ export class Library {
     for (const entry of raw) {
       const { item, url, reason } = normalize(entry, this.limits.itemBytes);
       if (!item) { rejected.push({ url: url || null, reason }); continue; }
-      const { bytes, ...content } = item;
+      const { bytes, folder: asked, ...content } = item;
+      const folder = this.spelling(asked);
       const sha = await sha256(JSON.stringify(content));
       const outcome = this.ctx.storage.transactionSync(() => {
-        const [old] = this.rows('select id, bytes, sha from item where url = ?', item.url);
-        // The same text again: nothing to write, nothing billed.
-        if (old && old.sha === sha) return { id: old.id, created: false, unchanged: true };
+        const [old] = this.rows('select id, bytes, sha, folder from item where url = ?', item.url);
+        // The same text again: nothing to write, nothing billed - unless it is
+        // asked into another folder, which moves it (one row).
+        if (old && old.sha === sha) {
+          if (folder && folder !== old.folder) {
+            this.rows('update item set folder = ? where id = ?', folder, old.id);
+            return { id: old.id, created: false, unchanged: true, moved: true };
+          }
+          return { id: old.id, created: false, unchanged: true };
+        }
         const total = this.size();
         if (total - (old?.bytes || 0) + item.bytes > this.limits.customerBytes) return { reason: 'the library is full' };
         const stamp = now();
         this.rows(
           'insert into item (url, platform, kind, external_id, title, author, published_at, duration_seconds, language,'
-          + ' text, segments, meta, bytes, sha, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          + ' text, segments, meta, bytes, sha, folder, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
           + ' on conflict(url) do update set platform = excluded.platform, kind = excluded.kind, external_id = excluded.external_id,'
           + ' title = excluded.title, author = excluded.author, published_at = excluded.published_at,'
           + ' duration_seconds = excluded.duration_seconds, language = excluded.language, text = excluded.text,'
           + ' segments = excluded.segments, meta = excluded.meta, bytes = excluded.bytes, sha = excluded.sha,'
-          + ' updated_at = excluded.updated_at',
+          + ' folder = coalesce(?, item.folder), updated_at = excluded.updated_at',
           item.url, item.platform, item.kind, item.external_id, item.title, item.author, item.published_at,
-          item.duration_seconds, item.language, item.text, item.segments, item.meta, item.bytes, sha, stamp, stamp,
+          item.duration_seconds, item.language, item.text, item.segments, item.meta, item.bytes, sha, folder || GENERAL,
+          stamp, stamp, folder,
         );
         const [{ id }] = this.rows('select id from item where url = ?', item.url);
         this.total = total - (old?.bytes || 0) + item.bytes;
         return { id, created: !old };
       });
       if (outcome.reason) rejected.push({ url: item.url, reason: outcome.reason });
-      else saved.push({ id: outcome.id, url: item.url, created: outcome.created, ...(outcome.unchanged ? { unchanged: true } : {}) });
+      else {
+        saved.push({ id: outcome.id, url: item.url, created: outcome.created, ...(outcome.unchanged ? { unchanged: true } : {}),
+          ...(outcome.moved ? { moved: true } : {}) });
+      }
     }
     return json(200, { saved, rejected, rows_written: this.written });
   }
@@ -324,8 +359,9 @@ export class Library {
     const before = Number(p.get('before')) || Number.MAX_SAFE_INTEGER;
     const items = this.rows(
       `select ${LIST_COLUMNS} from item where id < ? and (? is null or platform = ?)`
-      + ' and (? is null or lower(author) = lower(?)) order by id desc limit ?',
-      before, p.get('platform'), p.get('platform'), p.get('author'), p.get('author'), limit,
+      + ' and (? is null or lower(author) = lower(?)) and (? is null or folder = ? collate nocase) order by id desc limit ?',
+      before, p.get('platform'), p.get('platform'), p.get('author'), p.get('author'),
+      folderName(p.get('folder')), folderName(p.get('folder')), limit,
     );
     const next = items.length === limit ? items[items.length - 1].id : null;
     return json(200, { items, ...(next ? { next_before: next } : {}) });
@@ -358,12 +394,49 @@ export class Library {
     if (!match) return fail(400, 'q needs at least one word');
     const limit = Math.min(Math.max(Number(p.get('limit')) || 10, 1), 50);
     const results = this.rows(
-      'select i.id, i.url, i.platform, i.kind, i.title, i.author, i.published_at,'
+      'select i.id, i.url, i.folder, i.platform, i.kind, i.title, i.author, i.published_at,'
       + " snippet(item_fts, 2, '«', '»', ' … ', 24) as snippet from item_fts join item i on i.id = item_fts.rowid"
-      + ' where item_fts match ? and (? is null or i.platform = ?) order by bm25(item_fts) limit ?',
-      match, p.get('platform'), p.get('platform'), limit,
+      + ' where item_fts match ? and (? is null or i.platform = ?) and (? is null or i.folder = ? collate nocase)'
+      + ' order by bm25(item_fts) limit ?',
+      match, p.get('platform'), p.get('platform'), folderName(p.get('folder')), folderName(p.get('folder')), limit,
     );
     return json(200, { query: p.get('q'), results });
+  }
+
+  // A folder that exists keeps the spelling it has: "immobilien" is "Immobilien".
+  spelling(name) {
+    if (!name) return name;
+    const [found] = this.rows('select folder from item where folder = ? collate nocase limit 1', name);
+    return found?.folder || name;
+  }
+
+  // The folders there are, with how many texts each holds.
+  folders() {
+    const folders = this.rows('select folder as name, count(*) as items, coalesce(sum(bytes), 0) as bytes,'
+      + ' max(updated_at) as last_change from item group by folder collate nocase order by folder collate nocase');
+    return json(200, { folders });
+  }
+
+  // Moves one text (by id or link) into a folder, or renames a whole folder
+  // ({from, to}); a folder exists while it holds texts.
+  move(body) {
+    const to = this.spelling(folderName(body.to ?? body.folder));
+    if (!to) return fail(400, 'the folder to move into is required');
+    if (body.from !== undefined) {
+      const from = folderName(body.from);
+      if (!from) return fail(400, 'from must name a folder');
+      this.written = 0;
+      this.rows('update item set folder = ? where folder = ? collate nocase', to, from);
+      return json(200, { renamed: from, to, rows_written: this.written });
+    }
+    const id = Number(body.id) || null;
+    const link = body.url ? String(body.url) : null;
+    if (!id && !link) return fail(400, 'id or url of the text, or from (a folder to rename), is required');
+    const [item] = this.rows('select id, url from item where (? is not null and id = ?) or (? is not null and url = ?) limit 1',
+      id, id, link, link);
+    if (!item) return fail(404, 'no such text in this library');
+    this.rows('update item set folder = ? where id = ?', to, item.id);
+    return json(200, { id: item.id, url: item.url, folder: to });
   }
 
   usage() {

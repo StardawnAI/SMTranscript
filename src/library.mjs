@@ -48,6 +48,8 @@ export const noLibrary = {
   get: async () => { throw new Error(NOBODY); },
   remove: async () => { throw new Error(NOBODY); },
   usage: async () => { throw new Error(NOBODY); },
+  folders: async () => { throw new Error(NOBODY); },
+  move: async () => { throw new Error(NOBODY); },
 };
 
 const query = (params) => new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')).toString();
@@ -96,6 +98,8 @@ export function libraryClient({ url, key, headers = {} }, fetchImpl = fetch) {
     get: (params) => call('GET', `/v1/item?${query(params)}`),
     remove: (params) => call('DELETE', `/v1/item?${query(params)}`),
     usage: () => call('GET', '/v1/usage'),
+    folders: () => call('GET', '/v1/folders'),
+    move: (body) => call('POST', '/v1/move', body),
   };
 }
 
@@ -198,13 +202,19 @@ export function reusable(toolName, args) {
   return null;
 }
 
-async function reuse(library, want) {
+async function reuse(library, want, folder) {
   if (!want) return null;
   try {
     const item = await library.get(want.key);
     if (item.kind !== 'video' || !String(item.text || '').trim()) return null;
     if (want.segments && !(item.segments || []).length) return null;
-    return fromLibrary(item, { segments: want.segments });
+    // Asked into a folder: a kept text moves there.
+    let moved;
+    if (folder && String(item.folder || '').toLowerCase() !== String(folder).trim().toLowerCase()) {
+      moved = await library.move({ id: item.id, folder }).then((r) => r.folder).catch(() => undefined);
+    }
+    const out = fromLibrary(item, { segments: want.segments });
+    return { ...out, library: { ...(out.library || {}), folder: moved || item.folder } };
   } catch {
     // Not kept, or the library cannot answer: fetch as usual.
     return null;
@@ -218,11 +228,12 @@ async function reuse(library, want) {
 // says so instead.
 export function keeping(run, library, toolName) {
   return async (args, ctx = {}, deps = {}) => {
-    const kept = await reuse(library, reusable(toolName, args || {}));
+    const folder = typeof args?.folder === 'string' && args.folder.trim() ? args.folder.trim() : undefined;
+    const kept = await reuse(library, reusable(toolName, args || {}), folder);
     if (kept) return kept;
     const records = [];
     const keep = (record) => {
-      if (record?.url && String(record.text || '').trim()) records.push(record);
+      if (record?.url && String(record.text || '').trim()) records.push({ ...record, ...(folder ? { folder } : {}) });
     };
     let result;
     let error;
@@ -236,7 +247,8 @@ export function keeping(run, library, toolName) {
       try {
         const s = await library.save(records);
         const unchanged = s.saved.filter((x) => x.unchanged).length;
-        note = { kept: s.saved.length, ...(unchanged ? { unchanged } : {}), ...(s.rejected.length ? { notKept: s.rejected } : {}) };
+        note = { kept: s.saved.length, ...(folder ? { folder } : {}), ...(unchanged ? { unchanged } : {}),
+          ...(s.rejected.length ? { notKept: s.rejected } : {}) };
       } catch (e) {
         note = { error: `${e.message}; the text was fetched but not kept in the library` };
       }
@@ -252,6 +264,17 @@ export function keeping(run, library, toolName) {
 
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const PLATFORM = { type: 'string', enum: ['youtube', 'tiktok', 'instagram', 'vimeo'], description: 'Only this platform.' };
+const FOLDER_FILTER = { type: 'string', description: 'Only this folder (see library_folders).' };
+
+// What the fetching tools take when there is a library: the folder to keep
+// the texts in, and when to ask for one.
+export const FOLDER_ARG = {
+  type: 'string',
+  description: 'The library folder to keep the texts in, e.g. "Immobilien". A new name makes a new folder. '
+    + 'For an account, channel, playlist or search, when the user named no folder, ask first: one of the existing '
+    + 'folders (library_folders), a new one, or General for texts needed only for a while. A single video without '
+    + 'a folder goes to General, or stays where it is kept already; with a folder, a kept text moves there.',
+};
 
 export function libraryTools(library) {
   return [
@@ -264,11 +287,12 @@ export function libraryTools(library) {
         inputSchema: { type: 'object', properties: {
           query: { type: 'string', description: 'The words to find.' },
           platform: PLATFORM,
+          folder: FOLDER_FILTER,
           limit: { type: 'integer', minimum: 1, maximum: 50, description: 'Default 10.' },
         }, required: ['query'] },
         annotations: { title: 'Search the library', ...READ_ONLY },
       },
-      run: (args) => library.search({ q: args.query, platform: args.platform, limit: args.limit }),
+      run: (args) => library.search({ q: args.query, platform: args.platform, folder: args.folder, limit: args.limit }),
     },
     {
       tool: {
@@ -277,6 +301,7 @@ export function libraryTools(library) {
           + 'Page on with `before` set to the `next_before` of the last answer.',
         inputSchema: { type: 'object', properties: {
           platform: PLATFORM,
+          folder: FOLDER_FILTER,
           author: { type: 'string', description: 'Only this account or channel (exact name).' },
           limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Default 25.' },
           before: { type: 'integer', description: 'Continue after this id (next_before of the previous page).' },
@@ -284,7 +309,7 @@ export function libraryTools(library) {
         annotations: { title: 'List the library', ...READ_ONLY },
       },
       run: async (args) => ({
-        ...(await library.list({ platform: args.platform, author: args.author, limit: args.limit, before: args.before })),
+        ...(await library.list({ platform: args.platform, folder: args.folder, author: args.author, limit: args.limit, before: args.before })),
         usage: await library.usage(),
       }),
     },
@@ -312,6 +337,31 @@ export function libraryTools(library) {
         annotations: { title: 'Delete from the library', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
       run: (args) => library.remove({ id: args.id, url: args.url }),
+    },
+    {
+      tool: {
+        name: 'library_folders',
+        description: 'The folders of your library, each with how many texts it holds and when it last changed. '
+          + 'Texts kept without a folder are in General.',
+        inputSchema: { type: 'object', properties: {} },
+        annotations: { title: 'List the library folders', ...READ_ONLY },
+      },
+      run: () => library.folders(),
+    },
+    {
+      tool: {
+        name: 'library_move',
+        description: 'Move one kept text into a folder (by its id or link; a new name makes a new folder), '
+          + 'or rename a whole folder (from and to; renaming into a folder that exists merges them).',
+        inputSchema: { type: 'object', properties: {
+          id: { type: 'integer', description: 'The text to move: its id from library_search or library_list.' },
+          url: { type: 'string', description: 'Or the link it was fetched from.' },
+          from: { type: 'string', description: 'Or a whole folder to rename.' },
+          to: { type: 'string', description: 'The folder to move into, or the new name.' },
+        }, required: ['to'] },
+        annotations: { title: 'Move in the library', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      run: (args) => library.move(args.from !== undefined ? { from: args.from, to: args.to } : { id: args.id, url: args.url, to: args.to }),
     },
   ];
 }

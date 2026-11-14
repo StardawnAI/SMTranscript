@@ -124,3 +124,31 @@ test('asking for the mp4 link goes past the library to the worker, once a day', 
   assert.equal(sent[1].video_link, true);
   assert.match(sent[1].idempotency_key, /^video-link:https:\/\/www\.instagram\.com\/reel\/R7\/:\d{4}-\d{2}-\d{2}$/);
 });
+
+test('texts are kept in the folder the user names; a kept text asked into another folder moves there', async () => {
+  const { tool } = hub();
+  const ann = { id: 'user-ann' };
+  const api = { submit: async () => ({ job_id: 'F1', existing: false }), result: async () => ({ status: 200, data: reel('F1', 'Maklerprovision') }) };
+  const deps = { worker: { url: 'x', key: 'k' }, api, pollMs: 0, output: 'inline' };
+  const url = 'https://www.instagram.com/reel/F1/';
+  const first = await tool('get_social_transcript', ann)({ url, folder: 'Immobilien' }, { caller: ann }, deps);
+  assert.equal(first.library.folder, 'Immobilien');
+  assert.deepEqual((await tool('library_folders', ann)({})).folders.map((f) => [f.name, f.items]), [['Immobilien', 1]]);
+  assert.equal((await tool('library_list', ann)({ folder: 'immobilien' })).items.length, 1);
+  const again = await tool('get_social_transcript', ann)({ url, folder: 'Recht' }, { caller: ann }, deps);
+  assert.equal(again.library.reused, true, 'answered from the library');
+  assert.equal(again.library.folder, 'Recht');
+  assert.deepEqual((await tool('library_folders', ann)({})).folders.map((f) => f.name), ['Recht']);
+  await tool('library_move', ann)({ from: 'Recht', to: 'Steuern & Recht' });
+  assert.equal((await tool('library_search', ann)({ query: 'Maklerprovision', folder: 'Steuern & Recht' })).results.length, 1);
+});
+
+test('every fetching tool takes a folder, and says when to ask for one', () => {
+  const { library } = hub();
+  const list = tools({ SMTRANSCRIPT_WORKER_URL: 'https://w.example' }, library, { id: 'user-ann' });
+  for (const name of ['get_youtube_transcript', 'get_social_transcript', 'get_instagram_images']) {
+    const t = list.find((x) => x.tool.name === name);
+    assert.match(t.tool.inputSchema.properties.folder.description, /ask first/);
+  }
+  assert.ok(list.some((x) => x.tool.name === 'library_folders') && list.some((x) => x.tool.name === 'library_move'));
+});

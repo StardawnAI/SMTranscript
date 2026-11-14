@@ -280,3 +280,40 @@ test('a revoked member stays refused; an erased one starts empty', async () => {
   await call('DELETE', `/v1/admin/customers/${ann}?erase=true`, { key: env.ADMIN_TOKEN });
   assert.equal((await asOperator(env, 'GET', '/v1/items', { customer: ann })).data.items.length, 0);
 });
+
+test('texts go into folders; list and search per folder; the folders are listed with their counts', async () => {
+  const { call, customer } = stack();
+  const { key } = await customer('Kunde A');
+  await call('POST', '/v1/items', { key, body: { items: [{ ...reel(1, 'Grunderwerbsteuer'), folder: 'Immobilien' },
+    { ...reel(2, 'Grunderwerbsteuer Tipps'), folder: ' immobilien  ' }, reel(3, 'Grunderwerbsteuer am Rande')] } });
+  const folders = (await call('GET', '/v1/folders', { key })).data.folders;
+  assert.deepEqual(folders.map((f) => [f.name, f.items]), [['General', 1], ['Immobilien', 2]], 'case and spaces do not split a folder');
+  assert.equal((await call('GET', '/v1/items?folder=immobilien', { key })).data.items.length, 2);
+  assert.equal((await call('GET', '/v1/search?q=Grunderwerbsteuer&folder=General', { key })).data.results.length, 1);
+  assert.equal((await call('GET', '/v1/search?q=Grunderwerbsteuer', { key })).data.results.length, 3);
+});
+
+test('asking for a kept text into another folder moves it without rewriting it; a save without a folder keeps it', async () => {
+  const { call, customer } = stack();
+  const { key } = await customer('Kunde A');
+  await call('POST', '/v1/items', { key, body: { items: [reel(1, 'Mietrecht')] } });
+  const moved = await call('POST', '/v1/items', { key, body: { items: [{ ...reel(1, 'Mietrecht'), folder: 'Recht' }] } });
+  assert.equal(moved.data.saved[0].moved, true);
+  assert.ok(moved.data.rows_written <= 2, `a move writes the row, not the search index again (${moved.data.rows_written})`);
+  await call('POST', '/v1/items', { key, body: { items: [reel(1, 'Mietrecht neu')] } });
+  assert.equal((await call('GET', '/v1/items?folder=Recht', { key })).data.items.length, 1, 'a new text without a folder stays where it was');
+});
+
+test('one text is moved, a whole folder is renamed', async () => {
+  const { call, customer } = stack();
+  const { key } = await customer('Kunde A');
+  await call('POST', '/v1/items', { key, body: { items: [reel(1, 'a'), reel(2, 'b')] } });
+  const one = await call('POST', '/v1/move', { key, body: { url: reel(1, '').url, folder: 'Immobilien' } });
+  assert.equal(one.data.folder, 'Immobilien');
+  const renamed = await call('POST', '/v1/move', { key, body: { from: 'general', to: 'Später' } });
+  assert.equal(renamed.data.to, 'Später');
+  const folders = (await call('GET', '/v1/folders', { key })).data.folders.map((f) => f.name);
+  assert.deepEqual(folders, ['Immobilien', 'Später']);
+  assert.equal((await call('POST', '/v1/move', { key, body: { url: 'https://nope.example/x', folder: 'X' } })).status, 404);
+  assert.equal((await call('POST', '/v1/move', { key, body: { id: 1 } })).status, 400);
+});
