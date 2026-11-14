@@ -35,6 +35,7 @@ class Settings:
     bind: str
     routes: dict[str, str | None]  # route name -> proxy URL (None = direct)
     share_direct: tuple[str, ...]  # further routes that take turns with direct
+    direct_off: bool  # this machine's own line is never used: direct jobs go out on share_direct only
     default_route: dict[str, str]  # platform -> route name
     gap_seconds: dict[str, float]  # platform -> minimum gap between its requests on one route
     fetch_workers: int
@@ -109,6 +110,12 @@ def load() -> Settings:
     for route in share_direct:
         if route not in routes:
             raise SystemExit(f"SMT_SHARE_DIRECT names {route!r}, which is not a configured route")
+    # The machine's own line is not for platform requests (stardawneg64 is the
+    # founder's home network: tests only, never production). Then a job on
+    # direct goes out on the routes of SMT_SHARE_DIRECT only, and waits for them.
+    direct_off = os.environ.get("SMT_DIRECT_OFF", "").strip().lower() in ("1", "true", "yes")
+    if direct_off and not share_direct:
+        raise SystemExit("SMT_DIRECT_OFF needs SMT_SHARE_DIRECT: the routes that take direct's jobs")
     fallback = os.environ.get("SMT_DEFAULT_ROUTE", "direct")
     default_route = {p: os.environ.get(f"SMT_ROUTE_{p.upper()}", fallback) for p in PLATFORMS}
     for platform, route in default_route.items():
@@ -123,6 +130,7 @@ def load() -> Settings:
         bind=os.environ.get("SMT_BIND", "0.0.0.0"),
         routes=routes,
         share_direct=share_direct,
+        direct_off=direct_off,
         default_route=default_route,
         # Not platform limits — nobody publishes those. Starting values that a
         # measured run may lower or raise.

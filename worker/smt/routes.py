@@ -33,11 +33,12 @@ BREAKER_COOLDOWN_S = 10 * 60
 
 class Routes:
     def __init__(self, db: Db, routes: dict[str, str | None], gaps: dict[str, float],
-                 share_direct: tuple[str, ...] = ()):
+                 share_direct: tuple[str, ...] = (), direct_off: bool = False):
         self.db = db
         self.routes = routes
         self.gaps = gaps
         self.share_direct = share_direct
+        self.direct_off = direct_off
         self._picked: dict[str, float] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._last: dict[str, float] = {}
@@ -68,9 +69,11 @@ class Routes:
         with the routes that share it: the pair used least recently and not
         paused or blocked. Another route, or none free, stays as asked - a job
         never leaves a route it was explicitly given (warp protects direct)."""
-        pool = [route, *self.share_direct] if route == "direct" else [route]
-        if len(pool) == 1:
+        if route != "direct":
             return route
+        pool = list(self.share_direct) if self.direct_off else [route, *self.share_direct]
+        if len(pool) == 1:
+            return pool[0]
         now = time.time()
         free = []
         for name in pool:
@@ -80,7 +83,9 @@ class Routes:
                 continue
             free.append((max(self._last.get(key, 0), self._picked.get(key, 0)), name))
         if not free:
-            return route
+            # Nothing free: the job waits on its route - and never on this
+            # machine's own line when that is off.
+            return pool[0]
         chosen = min(free)[1]
         self._picked[f"{platform}:{chosen}"] = now
         return chosen

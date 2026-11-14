@@ -187,7 +187,7 @@ class FakeAsr:
 def settings(data: Path, **over) -> config.Settings:
     base = dict(
         data=data, keys=config.parse_keys(f"alice:{'a' * 21},bob:{'b' * 20},root:{'r' * 20}:admin"),
-        port=0, bind="127.0.0.1", routes={"direct": None, "warp": "http://warp:1080"}, share_direct=(),
+        port=0, bind="127.0.0.1", routes={"direct": None, "warp": "http://warp:1080"}, share_direct=(), direct_off=False,
         default_route={"tiktok": "direct", "instagram": "direct", "vimeo": "direct"},
         gap_seconds={"tiktok": 0, "instagram": 0, "vimeo": 0},
         fetch_workers=1, asr_workers=1, max_video_mb=50, max_duration_s=600, max_profile_items=50,
@@ -397,6 +397,15 @@ class EngineTest(unittest.TestCase):
         engine.routes.record("instagram", "hetzner", JobError("rate_limited", "429", retry_after=600))
         self.assertEqual({engine.routes.pick("instagram", "direct") for _ in range(3)}, {"direct"},
                          "a route that cools down is left out")
+        engine.db.conn.close()
+
+    def test_with_the_own_line_off_direct_jobs_only_ever_leave_through_the_shared_route(self):
+        engine = self.make(routes={"direct": None, "warp": "http://warp:1080", "hetzner": "http://h:1080"},
+                           share_direct=("hetzner",), direct_off=True)
+        self.assertEqual({engine.routes.pick("instagram", "direct") for _ in range(5)}, {"hetzner"})
+        engine.routes.record("instagram", "hetzner", JobError("rate_limited", "429", retry_after=600))
+        self.assertEqual(engine.routes.pick("instagram", "direct"), "hetzner",
+                         "a paused hetzner makes the job wait, it never falls back to the own line")
         engine.db.conn.close()
 
     def test_a_post_that_needs_a_login_is_not_fetched_again_the_same_day(self):

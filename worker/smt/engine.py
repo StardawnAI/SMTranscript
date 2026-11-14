@@ -149,7 +149,8 @@ class Engine:
     def __init__(self, settings: Settings, db: Db | None = None, asr_factory=None, ocr=None):
         self.s = settings
         self.db = db or Db(settings.db_path)
-        self.routes = Routes(self.db, settings.routes, settings.gap_seconds, settings.share_direct)
+        self.routes = Routes(self.db, settings.routes, settings.gap_seconds, settings.share_direct,
+                             settings.direct_off)
         for d in (settings.media_dir, settings.tmp_dir, settings.models_dir):
             d.mkdir(parents=True, exist_ok=True)
         self._asr_factory = asr_factory or self._make_asr
@@ -887,6 +888,7 @@ class Engine:
     def _profile(self, job: dict):
         opts = json.loads(job["options"])
         target = guard.parse(job["input_url"])
+        job = {**job, "route": self.routes.pick(target.platform, job["route"])}
         proxy = self.routes.proxy(job["route"])
         count = self._count(job["id"])
         row = self.db.one("select * from profile_cursor where job_id = ?", (job["id"],))
