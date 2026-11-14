@@ -1,7 +1,7 @@
 """An HTTPS proxy (HTTP CONNECT) that makes a second route for the SMTranscript worker.
 
 It runs on another machine (first: the Hetzner server mp-streamfab-test) and
-lets exactly one caller in - the worker's own address - with a user and
+lets only the workers' own addresses in (`allow`: one IP or a list), with a user and
 password (Proxy-Authorization: Basic). Every connection it opens leaves
 through one fixed local address (`source`), so the platform sees that
 machine's own IP even while a VPN holds the default route. CONNECT to port 443
@@ -25,7 +25,8 @@ CONF = json.loads(Path(__file__).with_suffix(".json").read_text())
 LISTEN = CONF.get("listen", "0.0.0.0")
 PORT = int(CONF.get("port", 1080))
 EXPECTED = ("Basic " + base64.b64encode(f"{CONF['user']}:{CONF['password']}".encode()).decode()).encode()
-ALLOW = CONF["allow"]
+# Who may use it: one IP or a list of them (the workers that route through it).
+ALLOW = set(CONF["allow"] if isinstance(CONF["allow"], list) else [CONF["allow"]])
 SOURCE = CONF["source"]
 MAX = int(CONF.get("max_connections", 64))
 LOG = Path(CONF.get("log") or Path(__file__).with_name("route-proxy.log"))
@@ -100,7 +101,7 @@ async def main():
     slots = asyncio.Semaphore(MAX)
 
     async def handle(reader, writer):
-        if writer.get_extra_info("peername")[0] != ALLOW:
+        if writer.get_extra_info("peername")[0] not in ALLOW:
             writer.close()
             return
         async with slots:
@@ -111,7 +112,7 @@ async def main():
                 writer.close()
 
     server = await asyncio.start_server(handle, LISTEN, PORT)
-    log(f"listening on {LISTEN}:{PORT}, only {ALLOW}, leaving from {SOURCE}")
+    log(f"listening on {LISTEN}:{PORT}, only {sorted(ALLOW)}, leaving from {SOURCE}")
     async with server:
         await server.serve_forever()
 

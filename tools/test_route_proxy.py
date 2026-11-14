@@ -62,6 +62,12 @@ class RouteProxyTest(unittest.TestCase):
         port = self.start(allow="203.0.113.9")
         self.assertEqual(self.ask(port, "CONNECT www.instagram.com:443 HTTP/1.1"), "")
 
+    def test_a_list_of_callers_is_allowed(self):
+        port = self.start(allow=["203.0.113.9", "127.0.0.1"])
+        self.assertIn("407", self.ask(port, "CONNECT www.instagram.com:443 HTTP/1.1", auth=None))
+        other = self.start(allow=["203.0.113.9", "198.51.100.7"])
+        self.assertEqual(self.ask(other, "CONNECT www.instagram.com:443 HTTP/1.1"), "")
+
     def test_only_https_and_no_private_address(self):
         port = self.start()
         self.assertIn("403", self.ask(port, "CONNECT www.instagram.com:80 HTTP/1.1"))
