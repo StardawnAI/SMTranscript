@@ -252,7 +252,11 @@ export async function waitResult(api, jobId, { seconds = WAIT_S, notify = () => 
     if (status === 200) return data;
     if (data.status !== last) notify(`${jobId}: ${data.status}${data.error ? ` (${data.error.class})` : ''}`);
     last = data.status;
-    const wait = pollMs ?? Math.min(Math.max(data.retry_after_s ?? 3, 1), 30) * 1000;
+    // A reel takes about 7 to 11 seconds on the worker: asked every second for
+    // the first 20 seconds, the answer goes out when it is there, not up to
+    // 3 seconds later.
+    const early = Date.now() < until - (seconds - 20) * 1000;
+    const wait = pollMs ?? (early ? 1000 : Math.min(Math.max(data.retry_after_s ?? 3, 1), 30) * 1000);
     if (Date.now() + wait > until) return null;
     await sleep(wait);
   }
@@ -290,6 +294,11 @@ export function shape(result, { includeSegments = true } = {}) {
   if (result.error) out.error = result.error;
   out.jobId = result.job_id;
   if (video) out.video = { artifactId: video.artifact_id, sha256: video.sha256, bytes: video.size };
+  // The platform's own link to the whole video (mp4): nothing was downloaded for it.
+  if (m.video_url) {
+    out.videoDownload = { url: m.video_url, readAt: m.video_url_read_at || null,
+      note: "Instagram's signed address of the mp4; it stops working after some days. Open it to download the video." };
+  }
   out.platformRequests = result.platform_requests;
   if (includeSegments) {
     out.segments = segments.map((s) => ({ text: s.text, start: clock(s.start_ms), end: clock(s.end_ms), startMs: s.start_ms, endMs: s.end_ms }));
@@ -561,7 +570,7 @@ export function socialTool(mode) {
     name: 'get_social_transcript',
     description: `Transcripts of TikTok, Instagram and Vimeo videos — one video, or the newest videos of a TikTok or Instagram account.
 
-The platform's own captions are used when it is clear they are the spoken words (a track in the language asked for, or the only one) — then no media is downloaded at all. Otherwise the audio is fetched and transcribed with Whisper on the worker (no API, no account). Music or silence comes back as an empty transcript with transcriptStatus "no_speech", not as invented text. An Instagram picture post comes back as its pictures (see get_instagram_images).
+The platform's own captions are used when it is clear they are the spoken words (a track in the language asked for, or the only one) — then no media is downloaded at all. ${inline ? 'Otherwise the audio streams from the platform straight to speech recognition (Groq Whisper) without being downloaded or kept.' : 'Otherwise the audio is fetched and transcribed with Whisper on the worker on this computer (no API, no account).'} An Instagram video also comes with videoDownload: the platform's own link to the mp4, for the user to download it. Music or silence comes back as an empty transcript with transcriptStatus "no_speech", not as invented text. An Instagram picture post comes back as its pictures (see get_instagram_images).
 
 - A video link: the transcript comes back in the answer, usually within seconds to a few minutes.
 - An account link: up to max_videos of its newest videos. ${inline ? `The transcripts come back in the answer, about ${INLINE_CHARS.toLocaleString('en-US')} characters at a time; call again with offset = nextOffset for more.` : `Each transcript is written to a file (<platform>_<videoId>.txt in save_to, default ./${DEFAULT_SAVE_DIR}) and the answer is an index; read the files you need.`}

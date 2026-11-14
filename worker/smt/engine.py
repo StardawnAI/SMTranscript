@@ -73,6 +73,28 @@ def _image_mime(path: Path) -> str:
 MEMBER = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.@\-]{0,119}")
 
 
+def _video_link(info: dict) -> str | None:
+    """The best format with picture and sound in one file, served over plain
+    HTTPS (no manifest), or None."""
+    whole = [f for f in info.get("formats") or []
+             if str(f.get("url") or "").startswith("https://")
+             and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
+             and str(f.get("protocol") or "https") in ("https", "http")]
+    if not whole:
+        return None
+    return max(whole, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))["url"]
+
+
+# A failure that asking again cannot change (the post needs a login, is private
+# or gone) is answered as it is when it is asked again within this time,
+# instead of fetching it again: on 2026-11-11 a caller asking every few minutes
+# made two such posts cost 3,517 Instagram requests each in three days.
+TERMINAL_AGAIN_AFTER_S = 24 * 3600
+# Only what the post itself is: a parser error or a setting here can be fixed
+# on our side, and then asking again must work at once.
+SETTLED = {"unavailable", "private", "login_required", "drm", "too_large"}
+
+
 def _member(options: dict | None) -> str | None:
     """Which user of the caller a job runs for (a hub user): it spends from that
     user's daily share of the transcription budget. Not part of the job's key, so
@@ -184,6 +206,9 @@ class Engine:
         key = idem or hashlib.sha256(json.dumps(
             {"kind": kind, "url": target.canonical_url, **options}, sort_keys=True).encode()).hexdigest()
         existing = self.db.one("select * from job where tenant = ? and idem_key = ?", (tenant, key))
+        if (existing and existing["status"] == "failed" and existing["error_class"] in SETTLED
+                and (existing["finished_at"] or 0) > _now() - TERMINAL_AGAIN_AFTER_S):
+            return existing, True
         if existing and existing["status"] in ("failed", "partial", "cancelled"):
             # Asking again after a failure means: try again. What is stored
             # already is kept, so the second try only does what is missing.
@@ -408,9 +433,14 @@ class Engine:
         )
         return {"id": art_id, "path": dst}
 
-    def _meta(self, info: dict) -> dict:
+    def _meta(self, info: dict, platform: str | None = None) -> dict:
         ts = info.get("timestamp")
+        link = _video_link(info) if platform == "instagram" else None
         return {
+            # The platform's own address of the whole video (picture and sound):
+            # nothing is downloaded here for it. Instagram signs it; it stops
+            # working after some days, so it carries when it was read.
+            **({"video_url": link, "video_url_read_at": _iso(_now())} if link else {}),
             "title": info.get("title") or info.get("fulltitle"),
             "description": info.get("description"),
             "author": info.get("uploader") or info.get("channel"),
@@ -425,7 +455,7 @@ class Engine:
                 "insert into media (platform, platform_id, part, canonical_url, info, info_at, meta)"
                 " values (?, ?, ?, ?, ?, ?, ?) on conflict (platform, platform_id, part) do update"
                 " set info = excluded.info, info_at = excluded.info_at, meta = excluded.meta",
-                (platform, platform_id, part, canonical, json.dumps(info), _now(), json.dumps(self._meta(info))),
+                (platform, platform_id, part, canonical, json.dumps(info), _now(), json.dumps(self._meta(info, platform))),
             )
         return self._parts(platform, platform_id)
 

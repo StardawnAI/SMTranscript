@@ -87,3 +87,23 @@ test('the worker job is charged to the caller who asked', async () => {
   await runSocialTool({ url: 'https://www.instagram.com/reel/R3/' }, {}, deps);
   assert.deepEqual(sent.map((b) => b.member), ['user:user-ann', 'user:user-ann', undefined]);
 });
+
+test('an Instagram video comes with the platform\'s own mp4 link', async () => {
+  const { shape } = await import('../src/social.mjs');
+  const r = reel('R9', 'x');
+  r.media.video_url = 'https://scontent.cdninstagram.com/v/t50/abc.mp4?oe=1';
+  r.media.video_url_read_at = '2026-11-14T15:00:00Z';
+  const out = shape(r);
+  assert.equal(out.videoDownload.url, r.media.video_url);
+  assert.match(out.videoDownload.note, /stops working/);
+  assert.equal(shape(reel('R8', 'x')).videoDownload, undefined);
+});
+
+test('a result that is ready soon is picked up within about a second', async () => {
+  const { waitResult } = await import('../src/social.mjs');
+  let asked = 0;
+  const api = { result: async () => (++asked < 3 ? { status: 202, data: { status: 'fetching', retry_after_s: 3 } } : { status: 200, data: { ok: true } }) };
+  const started = Date.now();
+  assert.deepEqual(await waitResult(api, 'job', { seconds: 60 }), { ok: true });
+  assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms; asked every 3 s it would be 6 s`);
+});

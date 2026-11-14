@@ -10,7 +10,7 @@ import { IMAGE_BLOCKS, imagesTool, runImagesTool, runSocialTool, socialTool } fr
 import { callerOf } from './caller.mjs';
 import { keeping, libraryFromEnv, libraryTools, noLibrary, youtubeRecord } from './library.mjs';
 
-export const VERSION = '3.4.0';
+export const VERSION = '3.5.0';
 const PROTOCOL = '2025-06-18';
 const DELAY_MS = Number(process.env.YOUTUBE_TRANSCRIPT_DELAY_MS || 1000);
 const CONCURRENCY = Number(process.env.YOUTUBE_TRANSCRIPT_CONCURRENCY || 3);

@@ -386,6 +386,33 @@ class EngineTest(unittest.TestCase):
         with self.assertRaises(JobError):
             self.engine.submit_video("alice", "https://www.tiktok.com/@someone")
 
+    def test_a_post_that_needs_a_login_is_not_fetched_again_the_same_day(self):
+        job, _ = self.engine.submit_video("starbase", IG)
+        self.engine.db.run("update job set status = 'failed', stage = null, error_class = 'login_required',"
+                           " finished_at = ? where id = ?", (time.time(), job["id"]))
+        again, existing = self.engine.submit_video("starbase", IG)
+        self.assertEqual((again["id"], again["status"], existing), (job["id"], "failed", True))
+        self.engine.db.run("update job set finished_at = ? where id = ?", (time.time() - 25 * 3600, job["id"]))
+        later, _ = self.engine.submit_video("starbase", IG)
+        self.assertEqual(later["status"], "queued", "a day later it is tried again")
+        self.engine.db.run("update job set status = 'failed', error_class = 'parser', finished_at = ? where id = ?",
+                           (time.time(), job["id"]))
+        fixed, _ = self.engine.submit_video("starbase", IG)
+        self.assertEqual(fixed["status"], "queued", "a failure we can fix on our side is tried again at once")
+
+    def test_an_instagram_video_carries_its_own_mp4_link(self):
+        from smt.engine import _video_link
+        info = {"formats": [
+            {"url": "https://cdn.example/v.m3u8", "vcodec": "avc1", "acodec": "mp4a", "protocol": "m3u8_native", "height": 1920},
+            {"url": "https://cdn.example/video-only.mp4", "vcodec": "avc1", "acodec": "none", "height": 1920},
+            {"url": "https://cdn.example/small.mp4", "vcodec": "avc1", "acodec": "mp4a", "protocol": "https", "height": 640},
+            {"url": "https://cdn.example/big.mp4", "vcodec": "avc1", "acodec": "mp4a", "protocol": "https", "height": 1280},
+        ]}
+        self.assertEqual(_video_link(info), "https://cdn.example/big.mp4")
+        self.assertIsNone(_video_link({"formats": [{"url": "http://plain/a.mp4", "vcodec": "a", "acodec": "b"}]}))
+        self.assertEqual(self.engine._meta(info, "instagram")["video_url"], "https://cdn.example/big.mp4")
+        self.assertNotIn("video_url", self.engine._meta(info, "tiktok"))
+
     def test_a_member_is_kept_but_is_not_part_of_the_key(self):
         a, _ = self.engine.submit_video("awghub", TT, {"member": "user:ann"})
         b, existing = self.engine.submit_video("awghub", TT, {"member": "user:bob"})
