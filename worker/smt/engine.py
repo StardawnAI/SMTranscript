@@ -76,13 +76,17 @@ MEMBER = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.@\-]{0,119}")
 def _video_link(info: dict) -> str | None:
     """The best format with picture and sound in one file, served over plain
     HTTPS (no manifest), or None."""
-    whole = [f for f in info.get("formats") or []
-             if str(f.get("url") or "").startswith("https://")
-             and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
+    # Instagram's whole files (its "video_versions") come without codecs: an
+    # unknown codec is no "none". The extractor lists worst first, so on equal
+    # height the later one wins.
+    formats = list(enumerate(info.get("formats") or []))
+    whole = [(i, f) for i, f in formats
+             if str(f.get("url") or "").startswith("https://") and f.get("ext", "mp4") == "mp4"
+             and f.get("vcodec") != "none" and f.get("acodec") != "none"
              and str(f.get("protocol") or "https") in ("https", "http")]
     if not whole:
         return None
-    return max(whole, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))["url"]
+    return max(whole, key=lambda x: (x[1].get("height") or 0, x[1].get("tbr") or 0, x[0]))[1]["url"]
 
 
 # A failure that asking again cannot change (the post needs a login, is private
@@ -215,7 +219,12 @@ class Engine:
         if (existing and existing["status"] == "failed" and existing["error_class"] in SETTLED
                 and (existing["finished_at"] or 0) > _now() - TERMINAL_AGAIN_AFTER_S):
             return existing, True
-        if existing and existing["status"] in ("failed", "partial", "cancelled"):
+        # Asking for the mp4 link of a done job whose link is old or missing:
+        # the post is read again (one request, no download).
+        stale_link = bool(existing and existing["status"] == "completed" and options.get("video_link")
+                          and existing["platform"] == "instagram" and existing["platform_id"]
+                          and not self._fresh_link(self._parts(existing["platform"], existing["platform_id"])))
+        if existing and (existing["status"] in ("failed", "partial", "cancelled") or stale_link):
             # Asking again after a failure means: try again. What is stored
             # already is kept, so the second try only does what is missing.
             self.db.run(

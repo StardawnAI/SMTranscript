@@ -410,6 +410,15 @@ class EngineTest(unittest.TestCase):
         ]}
         self.assertEqual(_video_link(info), "https://cdn.example/big.mp4")
         self.assertIsNone(_video_link({"formats": [{"url": "http://plain/a.mp4", "vcodec": "a", "acodec": "b"}]}))
+        # What Instagram really sends (2026-11-14): audio-only and video-only dash
+        # parts with codecs, and the whole files without any codec named.
+        real = {"formats": [
+            {"url": "https://cdn.example/a.m4a", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.5", "protocol": "https"},
+            {"url": "https://cdn.example/1.mp4", "ext": "mp4", "vcodec": None, "acodec": None, "protocol": "https"},
+            {"url": "https://cdn.example/3.mp4", "ext": "mp4", "vcodec": None, "acodec": None, "protocol": "https"},
+            {"url": "https://cdn.example/v.mp4", "ext": "mp4", "vcodec": "vp09", "acodec": "none", "protocol": "https", "height": 1920},
+        ]}
+        self.assertEqual(_video_link(real), "https://cdn.example/3.mp4")
         self.assertEqual(self.engine._meta(info, "instagram")["video_url"], "https://cdn.example/big.mp4")
         self.assertNotIn("video_url", self.engine._meta(info, "tiktok"))
 
@@ -437,6 +446,12 @@ class EngineTest(unittest.TestCase):
         self.drain()
         self.assertEqual(self.job(again["id"])["status"], "completed")
         self.assertEqual(self.fake.calls, [], "a link read in the last 12 hours is given as it is")
+        self.engine.db.run("update media set meta = json_set(meta, '$.video_url_read_at', '2020-01-01T00:00:00Z')")
+        self.fake.calls.clear()
+        same, existing = self.engine.submit_video("alice", IG, {"video_link": True}, idem="next-ask")
+        self.assertEqual((same["id"], same["status"]), (again["id"], "queued"), "an old link: the same job reads again")
+        self.drain()
+        self.assertEqual(self.fake.calls, ["resolve"])
 
     def test_a_member_is_kept_but_is_not_part_of_the_key(self):
         a, _ = self.engine.submit_video("awghub", TT, {"member": "user:ann"})
