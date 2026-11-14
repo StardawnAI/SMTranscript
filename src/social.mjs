@@ -386,10 +386,13 @@ export async function runSocialTool(args, { notify = () => {}, caller = null } =
   const member = memberOf(caller);
   const options = { route, priority: 'high', ...(args.language ? { language: args.language } : {}), ...(args.asr ? { asr: args.asr } : {}),
     ...(member ? { member } : {}) };
+  // The mp4 link, asked for: one job a day, so the link it gives is fresh.
+  const linkJob = args.video_link && link.platform === 'instagram'
+    ? { video_link: true, idempotency_key: `video-link:${input}:${new Date().toISOString().slice(0, 10)}` } : {};
   const wait = { notify, ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}), ...(deps.seconds ? { seconds: deps.seconds } : {}) };
 
   if (type === 'video') {
-    const job = await api.submit({ url: input, ...options });
+    const job = await api.submit({ url: input, ...options, ...linkJob });
     notify(job.existing ? `${job.job_id}: already known, reusing it` : `${job.job_id}: queued`);
     const result = await waitResult(api, job.job_id, wait);
     if (!result) {
@@ -557,6 +560,7 @@ export function socialTool(mode) {
     max_videos: { type: 'integer', minimum: 1, maximum: 100, description: 'Profile only: how many of the newest videos (default 10).' },
     since: { type: 'string', description: 'Profile only: videos from this date on, e.g. "2026-10-01".' },
     include_segments: { type: 'boolean', description: 'Single video only: timestamped segments. Default true.' },
+    video_link: { type: 'boolean', description: 'Instagram video only: also give videoDownload, a fresh link to the mp4, when the user wants to download or keep the video. Costs one more request to Instagram; nothing is downloaded here.' },
     route: { type: 'string', enum: ['direct', 'warp'], description: 'How to reach the platform. Default "direct"; "warp" goes through Cloudflare WARP.' },
     asr: { type: 'string', enum: ['auto', 'always'], description: '"always" transcribes the speech even when the platform has captions. Default "auto".' },
   };
@@ -570,7 +574,7 @@ export function socialTool(mode) {
     name: 'get_social_transcript',
     description: `Transcripts of TikTok, Instagram and Vimeo videos — one video, or the newest videos of a TikTok or Instagram account.
 
-The platform's own captions are used when it is clear they are the spoken words (a track in the language asked for, or the only one) — then no media is downloaded at all. ${inline ? 'Otherwise the audio streams from the platform straight to speech recognition (Groq Whisper) without being downloaded or kept.' : 'Otherwise the audio is fetched and transcribed with Whisper on the worker on this computer (no API, no account).'} An Instagram video also comes with videoDownload: the platform's own link to the mp4, for the user to download it. Music or silence comes back as an empty transcript with transcriptStatus "no_speech", not as invented text. An Instagram picture post comes back as its pictures (see get_instagram_images).
+The platform's own captions are used when it is clear they are the spoken words (a track in the language asked for, or the only one) — then no media is downloaded at all. ${inline ? 'Otherwise the audio streams from the platform straight to speech recognition (Groq Whisper) without being downloaded or kept.' : 'Otherwise the audio is fetched and transcribed with Whisper on the worker on this computer (no API, no account).'} When the user wants the video itself (download it, keep it, the mp4), set video_link: an Instagram video then comes with videoDownload, the platform's own link to the mp4. Music or silence comes back as an empty transcript with transcriptStatus "no_speech", not as invented text. An Instagram picture post comes back as its pictures (see get_instagram_images).
 
 - A video link: the transcript comes back in the answer, usually within seconds to a few minutes.
 - An account link: up to max_videos of its newest videos. ${inline ? `The transcripts come back in the answer, about ${INLINE_CHARS.toLocaleString('en-US')} characters at a time; call again with offset = nextOffset for more.` : `Each transcript is written to a file (<platform>_<videoId>.txt in save_to, default ./${DEFAULT_SAVE_DIR}) and the answer is an index; read the files you need.`}

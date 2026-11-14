@@ -190,7 +190,8 @@ export function reusable(toolName, args) {
     return id ? { key: { platform: 'youtube', external_id: id }, segments: args.include_segments ?? true } : null;
   }
   if (toolName === 'get_social_transcript') {
-    if (args.url_type && args.url_type !== 'video') return null;
+    // The library keeps words; an mp4 link has to come from the platform.
+    if ((args.url_type && args.url_type !== 'video') || args.video_link) return null;
     const key = linkKey(args.url);
     return key && key.platform !== 'youtube' ? { key, segments: args.include_segments ?? true } : null;
   }

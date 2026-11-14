@@ -413,6 +413,31 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(self.engine._meta(info, "instagram")["video_url"], "https://cdn.example/big.mp4")
         self.assertNotIn("video_url", self.engine._meta(info, "tiktok"))
 
+    def test_asking_for_the_mp4_link_reads_the_post_again_without_downloading(self):
+        plain = self.fake.resolve
+
+        def resolve(url, proxy, count, cookiefile=None):
+            infos = plain(url, proxy, count, cookiefile)
+            for i in infos:
+                i["formats"] = [{"url": "https://cdn.example/whole.mp4", "vcodec": "avc1", "acodec": "mp4a",
+                                 "protocol": "https", "height": 1280}]
+            return infos
+        self.fake.resolve = resolve
+        job, _ = self.engine.submit_video("alice", IG)
+        self.drain()
+        self.engine.db.run("update media set meta = json_remove(meta, '$.video_url', '$.video_url_read_at')")
+        self.fake.calls.clear()
+        linked, _ = self.engine.submit_video("alice", IG, {"video_link": True})
+        self.assertNotEqual(linked["id"], job["id"], "asking for the link is a job of its own")
+        self.drain()
+        self.assertEqual(self.fake.calls, ["resolve"], "one read of the post, no download")
+        self.assertEqual(self.engine.result(self.job(linked["id"]))["media"]["video_url"], "https://cdn.example/whole.mp4")
+        self.fake.calls.clear()
+        again, _ = self.engine.submit_video("alice", IG, {"video_link": True}, idem="next-ask")
+        self.drain()
+        self.assertEqual(self.job(again["id"])["status"], "completed")
+        self.assertEqual(self.fake.calls, [], "a link read in the last 12 hours is given as it is")
+
     def test_a_member_is_kept_but_is_not_part_of_the_key(self):
         a, _ = self.engine.submit_video("awghub", TT, {"member": "user:ann"})
         b, existing = self.engine.submit_video("awghub", TT, {"member": "user:bob"})

@@ -124,7 +124,7 @@ class RemoteAsr:
                               **({"member": member} if member else {})}).encode()
         request = urllib.request.Request(self.url + "/v1/transcribe", data=payload,
             headers={"Authorization": "Bearer " + self.token, "X-Groq-Key": self.key,
-                     "Content-Type": "application/json", "User-Agent": "SMTranscript/3.5.0"})
+                     "Content-Type": "application/json", "User-Agent": "SMTranscript/3.5.1"})
         try:
             # paid-call: Cloudflare Budget atomically reserves euros across all callers;
             # stable identity prevents a second provider call after an uncertain response.

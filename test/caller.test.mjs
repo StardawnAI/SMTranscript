@@ -107,3 +107,20 @@ test('a result that is ready soon is picked up within about a second', async () 
   assert.deepEqual(await waitResult(api, 'job', { seconds: 60 }), { ok: true });
   assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms; asked every 3 s it would be 6 s`);
 });
+
+test('asking for the mp4 link goes past the library to the worker, once a day', async () => {
+  const { tool } = hub();
+  const ann = { id: 'user-ann' };
+  const sent = [];
+  const api = { submit: async (body) => { sent.push(body); return { job_id: 'R7', existing: false }; },
+    result: async () => ({ status: 200, data: reel('R7', 'Kaufnebenkosten') }) };
+  const deps = { worker: { url: 'x', key: 'k' }, api, pollMs: 0, output: 'inline' };
+  const url = 'https://www.instagram.com/reel/R7/';
+  await tool('get_social_transcript', ann)({ url }, { caller: ann }, deps);
+  await tool('get_social_transcript', ann)({ url }, { caller: ann }, deps);
+  assert.equal(sent.length, 1, 'the second ask is answered from the library');
+  await tool('get_social_transcript', ann)({ url, video_link: true }, { caller: ann }, deps);
+  assert.equal(sent.length, 2, 'asking for the link goes to the worker');
+  assert.equal(sent[1].video_link, true);
+  assert.match(sent[1].idempotency_key, /^video-link:https:\/\/www\.instagram\.com\/reel\/R7\/:\d{4}-\d{2}-\d{2}$/);
+});

@@ -90,6 +90,9 @@ def _video_link(info: dict) -> str | None:
 # instead of fetching it again: on 2026-11-11 a caller asking every few minutes
 # made two such posts cost 3,517 Instagram requests each in three days.
 TERMINAL_AGAIN_AFTER_S = 24 * 3600
+# Instagram's signed mp4 links last some days; one read in the last 12 hours is
+# given out as it is, an older one is read again when a link is asked for.
+LINK_FRESH_S = 12 * 3600
 # Only what the post itself is: a parser error or a setting here can be fixed
 # on our side, and then asking again must work at once.
 SETTLED = {"unavailable", "private", "login_required", "drm", "too_large"}
@@ -197,6 +200,9 @@ class Engine:
             if name == "describe_video" and prov != "gemini":
                 raise JobError("invalid_input", "describe_video needs a Gemini model: only Gemini watches videos")
             out[name] = wanted
+        # The mp4 link: only when asked, so a job without it keeps its old key.
+        if options.get("video_link"):
+            out["video_link"] = True
         return out
 
     def _insert(self, tenant: str, kind: str, target: guard.Target, url: str, options: dict,
@@ -488,6 +494,8 @@ class Engine:
         if not known and (opts["asr_model"].startswith("groq:") or not parts or
                           any(self._video(p["id"]) is None for p in parts)):
             parts = self._download(job, target, parts, proxy, count)
+        elif opts.get("video_link") and target.platform == "instagram" and not self._fresh_link(parts):
+            parts = self._refresh_link(job, target, proxy, count)
         self._set(job["id"], media_id=parts[0]["id"])
 
         if known or all(self._chosen(p["id"], opts) and not self._needs_description(p["id"], opts) for p in parts):
@@ -555,6 +563,27 @@ class Engine:
                     for track in got["captions"]:
                         self._store_captions(media, track)
             return self._parts(platform, target.platform_id)
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+    def _fresh_link(self, parts: list[dict]) -> bool:
+        """Whether the post's mp4 link was read in the last 12 hours."""
+        meta = json.loads(parts[0]["meta"]) if parts else {}
+        read = meta.get("video_url_read_at")
+        return bool(meta.get("video_url") and read
+                    and dt.datetime.fromisoformat(read.replace("Z", "+00:00")).timestamp() > _now() - LINK_FRESH_S)
+
+    def _refresh_link(self, job, target, proxy, count) -> list[dict]:
+        """Reads the post once more for its mp4 link: one platform request,
+        nothing downloaded; the transcript that exists stays."""
+        tmp_root = self.s.tmp_dir / job["id"]
+        cookie_dir = tmp_root / "session"
+        cookie_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            cookiefile = self.fetch.cookie_copy(self.s.cookies_dir, target.platform, cookie_dir)
+            with self.fetch.session(proxy, cookiefile, self.s.max_video_mb, self.s.keep_media, count) as ses:
+                infos = self._resolve(job, target, ses)
+                return self._media_rows(target.platform, target.platform_id, target.canonical_url, infos)
         finally:
             shutil.rmtree(tmp_root, ignore_errors=True)
 
