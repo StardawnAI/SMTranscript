@@ -40,6 +40,8 @@ New-Item -ItemType Directory -Force "$dir\app" | Out-Null
 Copy-Item -Recurse -Force "$src\worker\smt" "$dir\app\smt"
 Copy-Item -Force "$src\worker\requirements.lock", "$src\deploy\windows\run-worker.py" "$dir\"
 & C:\Python312\python.exe -m pip install --disable-pip-version-check --no-warn-script-location --no-deps -r "$dir\requirements.lock" | Out-Null
+# Windows only: tqdm needs colorama there, which the Linux lock does not list.
+& C:\Python312\python.exe -m pip install --disable-pip-version-check --no-warn-script-location colorama | Out-Null
 & C:\Python312\python.exe -m pip check
 Set-Content -Path "$dir\commit.txt" -Value $Commit -Encoding ascii
 
