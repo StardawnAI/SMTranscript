@@ -34,6 +34,7 @@ class Settings:
     port: int
     bind: str
     routes: dict[str, str | None]  # route name -> proxy URL (None = direct)
+    share_direct: tuple[str, ...]  # further routes that take turns with direct
     default_route: dict[str, str]  # platform -> route name
     gap_seconds: dict[str, float]  # platform -> minimum gap between its requests on one route
     fetch_workers: int
@@ -96,6 +97,18 @@ def load() -> Settings:
     routes: dict[str, str | None] = {"direct": None}
     if os.environ.get("SMT_WARP_PROXY"):
         routes["warp"] = os.environ["SMT_WARP_PROXY"]
+    # More ways out, each a proxy on a machine of its own: "name=url,name=url".
+    for item in filter(None, (p.strip() for p in os.environ.get("SMT_EXTRA_ROUTES", "").split(","))):
+        name, _, url = item.partition("=")
+        if not name or not url or name in routes:
+            raise SystemExit(f"SMT_EXTRA_ROUTES: {name or item!r} is not name=proxy-url, or the name is taken")
+        routes[name] = url
+    # Routes that take turns with direct: a job on direct goes out on whichever
+    # of them is free soonest, so two addresses ask the platform side by side.
+    share_direct = tuple(r for r in (p.strip() for p in os.environ.get("SMT_SHARE_DIRECT", "").split(",")) if r)
+    for route in share_direct:
+        if route not in routes:
+            raise SystemExit(f"SMT_SHARE_DIRECT names {route!r}, which is not a configured route")
     fallback = os.environ.get("SMT_DEFAULT_ROUTE", "direct")
     default_route = {p: os.environ.get(f"SMT_ROUTE_{p.upper()}", fallback) for p in PLATFORMS}
     for platform, route in default_route.items():
@@ -109,6 +122,7 @@ def load() -> Settings:
         port=_int("SMT_PORT", 8765),
         bind=os.environ.get("SMT_BIND", "0.0.0.0"),
         routes=routes,
+        share_direct=share_direct,
         default_route=default_route,
         # Not platform limits — nobody publishes those. Starting values that a
         # measured run may lower or raise.

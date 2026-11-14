@@ -149,7 +149,7 @@ class Engine:
     def __init__(self, settings: Settings, db: Db | None = None, asr_factory=None, ocr=None):
         self.s = settings
         self.db = db or Db(settings.db_path)
-        self.routes = Routes(self.db, settings.routes, settings.gap_seconds)
+        self.routes = Routes(self.db, settings.routes, settings.gap_seconds, settings.share_direct)
         for d in (settings.media_dir, settings.tmp_dir, settings.models_dir):
             d.mkdir(parents=True, exist_ok=True)
         self._asr_factory = asr_factory or self._make_asr
@@ -479,8 +479,10 @@ class Engine:
             return self._fetch_images(job)
         opts = json.loads(job["options"])
         count = self._count(job["id"])
-        proxy = self.routes.proxy(job["route"])
         target = guard.parse(job["input_url"])
+        # A job on direct may go out on a route that shares it (routes.pick).
+        job = {**job, "route": self.routes.pick(target.platform, job["route"])}
+        proxy = self.routes.proxy(job["route"])
 
         if target.kind == "short":
             self._set(job["id"], status="resolving")
@@ -799,6 +801,7 @@ class Engine:
                 return self._finish(job["id"])
             # Somebody waits for the pictures: their links once more, the text stays.
         count = self._count(job["id"])
+        job = {**job, "route": self.routes.pick("instagram", job["route"])}
         proxy = self.routes.proxy(job["route"])
         self._set(job["id"], status="resolving")
         with self.routes.request("instagram", job["route"]):
