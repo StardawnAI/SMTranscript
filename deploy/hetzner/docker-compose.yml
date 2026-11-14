@@ -1,0 +1,42 @@
+# SMTranscript worker for the AWG hub, on its own Hetzner server
+# (smtranscript-worker, cx23 nbg1). The hub reaches it through a Cloudflare
+# tunnel (cloudflared below) with Cloudflare Access in front; no port is open.
+# Moved here from stardawneg64 on 2026-11-14: the founder's home network is
+# for tests only, never production.
+services:
+  smtranscript:
+    container_name: smtranscript
+    image: smtranscript-worker:${SMTRANSCRIPT_REF:-9e4776518f5f187dfe4e170d2b2187c6bcf9fa45}
+    build:
+      context: https://github.com/StardawnAI/SMTranscript.git#${SMTRANSCRIPT_REF:-9e4776518f5f187dfe4e170d2b2187c6bcf9fa45}:worker
+    restart: unless-stopped
+    cpus: 2
+    environment:
+      OMP_NUM_THREADS: 2
+      SMT_API_KEYS: starbase:${INGEST_SMTRANSCRIPT_KEY:?the StarBase key is missing}${INGEST_SMTRANSCRIPT_MORE_KEYS:-}
+      SMT_ASR_MODEL: ${INGEST_SMTRANSCRIPT_MODEL:-groq:whisper-large-v3-turbo}
+      SMT_FETCH_WORKERS: 2
+      SMT_KEEP_MEDIA: 0
+      SMT_ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SMT_GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      SMT_OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      SMT_TRANSCRIPT_RELAY_URL: ${INGEST_SMTRANSCRIPT_RELAY_URL:-}
+      SMT_TRANSCRIPT_RELAY_TOKEN: ${INGEST_SMTRANSCRIPT_RELAY_TOKEN:-}
+      SMT_GROQ_API_KEY: ${GROQ_API_KEY:-}
+    ports:
+      - "127.0.0.1:47830:8765"
+    volumes:
+      - smt-data:/data
+
+  cloudflared:
+    container_name: cloudflared
+    image: cloudflare/cloudflared:2026.10.0
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    depends_on: [smtranscript]
+    profiles: [tunnel]
+
+volumes:
+  smt-data:
