@@ -56,7 +56,10 @@ def main() -> None:
         "PYTHONUNBUFFERED": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    os.environ.update({k: v for k, v in settings.items() if v != ""})
+    # Any SMT_* line in worker.env goes to the worker as it is (e.g.
+    # SMT_GAP_INSTAGRAM); the fixed ones above win.
+    passed = {k: v for k, v in env.items() if k.startswith("SMT_") and k not in settings}
+    os.environ.update({**passed, **{k: v for k, v in settings.items() if v != ""}})
     tools = [env.get("FFMPEG_DIR"), env.get("TESSERACT_DIR")]
     os.environ["PATH"] = os.pathsep.join([t for t in tools if t] + [os.environ.get("PATH", "")])
     sys.path.insert(0, str(HERE / "app"))
