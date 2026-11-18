@@ -10,7 +10,7 @@ import { IMAGE_BLOCKS, imagesTool, runImagesTool, runSocialTool, socialTool } fr
 import { callerOf } from './caller.mjs';
 import { FOLDER_ARG, keeping, libraryFromEnv, libraryTools, noLibrary, youtubeRecord } from './library.mjs';
 
-export const VERSION = '3.6.0';
+export const VERSION = '3.6.1';
 const PROTOCOL = '2025-06-18';
 const DELAY_MS = Number(process.env.YOUTUBE_TRANSCRIPT_DELAY_MS || 1000);
 const CONCURRENCY = Number(process.env.YOUTUBE_TRANSCRIPT_CONCURRENCY || 3);
@@ -300,7 +300,14 @@ export function serve({ input = process.stdin, output = process.stdout } = {}) {
     initialize: (params) => ({
       protocolVersion: /^\d{4}-\d{2}-\d{2}$/.test(params?.protocolVersion || '') ? params.protocolVersion : PROTOCOL,
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'smtranscript', version: VERSION },
+      serverInfo: {
+        name: 'smtranscript', title: 'AWG Social Media', version: VERSION,
+        websiteUrl: 'https://github.com/StardawnAI/SMTranscript',
+        icons: [512, 192].map((size) => ({
+          src: `https://awg.stardawn-service.com/brand/awg-icon-${size}.png`,
+          mimeType: 'image/png', sizes: [`${size}x${size}`],
+        })),
+      },
     }),
     ping: () => ({}),
     'tools/list': () => ({ tools: tools().map((t) => t.tool) }),
