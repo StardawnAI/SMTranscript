@@ -194,3 +194,40 @@ test('a library that cannot answer the lookup does not stop the fetch', async ()
   assert.equal(out.fullText, 'trotzdem da');
   assert.match(out.library.error, /not kept/);
 });
+
+test('the chat model works a folder through with the schema tools until nothing remains', async () => {
+  const { library } = await libraryFor('Kunde A');
+  await library.save([1, 2, 3].map((n) => ({
+    url: `https://www.instagram.com/reel/S${n}/`, platform: 'instagram', kind: 'video', author: 'immo.dommi',
+    text: `Tipp ${n}: Kauf über die GmbH`, folder: 'Immobilien-Tipps',
+  })));
+  const named = Object.fromEntries(tools({}, library).map((t) => [t.tool.name, t]));
+  for (const n of ['schema_save', 'schema_list', 'schema_next', 'schema_results_save', 'schema_results', 'schema_delete']) {
+    assert.ok(named[n], `${n} is offered`);
+  }
+  const definition = { idea: 'string', who: { enum: ['alleine', 'ehepartner_noetig', 'gmbh_oder_holding'] } };
+  const saved = await named.schema_save.run({ name: 'Invest-Ideen', folder: 'Immobilien-Tipps', definition });
+  assert.equal(saved.schema.remaining, 3);
+  // The loop a model runs: next texts, extract, keep, until remaining is 0.
+  for (let round = 0; round < 5; round++) {
+    const next = await named.schema_next.run({ name: 'Invest-Ideen', limit: 2 });
+    if (!next.items.length) break;
+    assert.deepEqual(next.schema.definition, definition);
+    const kept = await named.schema_results_save.run({ schema: 'Invest-Ideen', results: next.items.map((i) => ({
+      item_id: i.id, result: { idea: i.text, who: 'gmbh_oder_holding' },
+    })) });
+    assert.equal(kept.rejected.length, 0);
+  }
+  const listed = await named.schema_list.run({});
+  assert.deepEqual([listed.schemas[0].extracted, listed.schemas[0].remaining], [3, 0]);
+  const results = await named.schema_results.run({ name: 'Invest-Ideen' });
+  assert.deepEqual(results.results.map((r) => r.result.idea), ['Tipp 3: Kauf über die GmbH', 'Tipp 2: Kauf über die GmbH', 'Tipp 1: Kauf über die GmbH']);
+  assert.equal((await named.schema_delete.run({ name: 'Invest-Ideen' })).results_deleted, 3);
+});
+
+test('without a library of the caller every schema tool says so in words, not with a crash', async () => {
+  const { libraryTools, noLibrary } = await import('../src/library.mjs');
+  for (const t of libraryTools(noLibrary).filter((x) => x.tool.name.startsWith('schema_'))) {
+    await assert.rejects(t.run({ name: 'S', schema: 'S', folder: 'F', definition: 'x', results: [] }), (e) => !(e instanceof TypeError), t.tool.name);
+  }
+});

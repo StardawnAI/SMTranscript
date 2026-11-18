@@ -9,6 +9,18 @@
 const KEY = /^sml_([a-z0-9]{16})_([a-f0-9]{48})$/;
 const MAX_BODY = 5 * 1024 * 1024;
 const MAX_BATCH = 50;
+// A schema's definition and one text's result: big enough for a deep,
+// many-level schema, small enough that a runaway answer cannot fill a library.
+const SCHEMA_CHARS = 20000;
+const RESULT_BYTES = 20000;
+// A result or definition kept as JSON comes back as JSON; anything else as the text it was.
+const parseKept = (text) => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+};
 
 const num = (value, fallback) => (Number(value) > 0 ? Number(value) : fallback);
 export const limits = (env = {}) => ({
@@ -129,6 +141,15 @@ const SCHEMA = [
     + " insert into item_fts(item_fts, rowid, title, author, text) values ('delete', old.id, old.title, old.author, old.text);"
     + ' insert into item_fts(rowid, title, author, text) values (new.id, new.title, new.author, new.text); end',
   'create table if not exists usage_day (day text primary key, requests integer not null)',
+  // What the customer's chat model is to pull out of every text of a folder, and
+  // what it pulled out, one result per text. The model doing it is the
+  // customer's own (Claude or ChatGPT); the library only keeps both.
+  'create table if not exists extract_schema (name text primary key collate nocase, folder text not null,'
+    + ' description text, definition text not null, created_at text not null, updated_at text not null)',
+  'create table if not exists extraction (schema_name text not null collate nocase, item_id integer not null,'
+    + ' result text not null, bytes integer not null, updated_at text not null, primary key (schema_name, item_id))',
+  'create trigger if not exists item_ad_extraction after delete on item begin'
+    + ' delete from extraction where item_id = old.id; end',
 ];
 // Added after the first deploy; databases made before get them in schema().
 const ADDED = [
@@ -182,7 +203,10 @@ export class Library {
   // The library's size, read once per object and kept up to date in memory:
   // summing the table on every save would read every row each time.
   size() {
-    if (this.total === null) this.total = this.rows('select coalesce(sum(bytes), 0) as total from item')[0].total;
+    if (this.total === null) {
+      this.total = this.rows('select (select coalesce(sum(bytes), 0) from item)'
+        + ' + (select coalesce(sum(bytes), 0) from extraction) as total')[0].total;
+    }
     return this.total;
   }
 
@@ -300,7 +324,131 @@ export class Library {
     if (method === 'GET' && url.pathname === '/v1/usage') return this.usage();
     if (method === 'GET' && url.pathname === '/v1/folders') return this.folders();
     if (method === 'POST' && url.pathname === '/v1/move') return this.move(await readJson(request));
+    if (method === 'POST' && url.pathname === '/v1/schemas') return this.schemaSave(await readJson(request));
+    if (method === 'GET' && url.pathname === '/v1/schemas') return this.schemaList();
+    if (url.pathname === '/v1/schema' && (method === 'GET' || method === 'DELETE')) return this.schemaOne(p, method === 'DELETE');
+    if (method === 'GET' && url.pathname === '/v1/schema/next') return this.schemaNext(p);
+    if (method === 'POST' && url.pathname === '/v1/extractions') return this.extractionSave(await readJson(request));
+    if (method === 'GET' && url.pathname === '/v1/extractions') return this.extractionList(p);
     return fail(404, 'no such route');
+  }
+
+  // A schema with how far its folder is: texts in the folder, texts with a result.
+  schemaRow(name) {
+    const [s] = this.rows('select name, folder, description, definition, created_at, updated_at from extract_schema'
+      + ' where name = ? collate nocase', name);
+    if (!s) return null;
+    const [{ total }] = this.rows('select count(*) as total from item where folder = ? collate nocase', s.folder);
+    const [{ done }] = this.rows('select count(*) as done from extraction e join item i on i.id = e.item_id'
+      + ' where e.schema_name = ? collate nocase and i.folder = ? collate nocase', s.name, s.folder);
+    return { ...s, definition: parseKept(s.definition), texts: total, extracted: done, remaining: total - done };
+  }
+
+  schemaSave(body) {
+    const name = folderName(body.name);
+    if (!name) return fail(400, 'name is required');
+    const folder = this.spelling(folderName(body.folder));
+    if (!folder) return fail(400, 'folder is required');
+    if (body.definition === undefined || body.definition === null || body.definition === '') {
+      return fail(400, 'definition is required: the fields to pull out of every text');
+    }
+    const definition = typeof body.definition === 'string' ? body.definition : JSON.stringify(body.definition);
+    if (definition.length > SCHEMA_CHARS) return fail(400, `definition over ${SCHEMA_CHARS} characters`);
+    const stamp = now();
+    this.rows('insert into extract_schema (name, folder, description, definition, created_at, updated_at) values (?, ?, ?, ?, ?, ?)'
+      + ' on conflict(name) do update set folder = excluded.folder, description = excluded.description,'
+      + ' definition = excluded.definition, updated_at = excluded.updated_at',
+    name, folder, short(body.description, 2000), definition, stamp, stamp);
+    return json(200, { schema: this.schemaRow(name) });
+  }
+
+  schemaList() {
+    const names = this.rows('select name from extract_schema order by name collate nocase');
+    return json(200, { schemas: names.map((n) => {
+      const { definition, ...rest } = this.schemaRow(n.name);
+      return rest;
+    }) });
+  }
+
+  schemaOne(p, remove) {
+    const s = this.schemaRow(folderName(p.get('name')));
+    if (!s) return fail(404, 'no such schema in this library');
+    if (!remove) return json(200, { schema: s });
+    this.ctx.storage.transactionSync(() => {
+      const [{ freed }] = this.rows('select coalesce(sum(bytes), 0) as freed from extraction where schema_name = ? collate nocase', s.name);
+      this.rows('delete from extraction where schema_name = ? collate nocase', s.name);
+      this.rows('delete from extract_schema where name = ? collate nocase', s.name);
+      if (this.total !== null) this.total -= freed;
+    });
+    return json(200, { deleted: s.name, results_deleted: s.extracted });
+  }
+
+  // The next texts of the schema's folder that have no result yet, oldest
+  // first, up to `limit` texts and about `max_chars` characters (always at least one).
+  schemaNext(p) {
+    const s = this.schemaRow(folderName(p.get('name')));
+    if (!s) return fail(404, 'no such schema in this library');
+    const limit = Math.min(Math.max(Number(p.get('limit')) || 20, 1), MAX_BATCH);
+    const maxChars = Math.min(Math.max(Number(p.get('max_chars')) || 60000, 1000), 200000);
+    const rows = this.rows('select i.id, i.url, i.platform, i.kind, i.title, i.author, i.published_at, i.text from item i'
+      + ' where i.folder = ? collate nocase and not exists (select 1 from extraction e where e.schema_name = ? collate nocase'
+      + ' and e.item_id = i.id) order by i.id limit ?', s.folder, s.name, limit);
+    const items = [];
+    let chars = 0;
+    for (const row of rows) {
+      if (items.length && chars + row.text.length > maxChars) break;
+      items.push(row);
+      chars += row.text.length;
+    }
+    const { definition, description, name, folder, remaining } = s;
+    return json(200, { schema: { name, folder, description, definition }, items, remaining });
+  }
+
+  extractionSave(body) {
+    const s = this.schemaRow(folderName(body.schema));
+    if (!s) return fail(404, 'no such schema in this library');
+    const raw = Array.isArray(body.results) ? body.results : [];
+    if (!raw.length || raw.length > MAX_BATCH) return fail(400, `results: 1 to ${MAX_BATCH} per request`);
+    this.written = 0;
+    const saved = [];
+    const rejected = [];
+    for (const entry of raw) {
+      const id = Number(entry?.item_id) || null;
+      if (!id) { rejected.push({ item_id: entry?.item_id ?? null, reason: 'item_id is required' }); continue; }
+      if (entry.result === undefined || entry.result === null) { rejected.push({ item_id: id, reason: 'result is required' }); continue; }
+      const result = typeof entry.result === 'string' ? entry.result : JSON.stringify(entry.result);
+      const bytes = utf8(result);
+      if (bytes > RESULT_BYTES) { rejected.push({ item_id: id, reason: `result over ${RESULT_BYTES} bytes` }); continue; }
+      const outcome = this.ctx.storage.transactionSync(() => {
+        const [item] = this.rows('select id from item where id = ?', id);
+        if (!item) return { reason: 'no such text in this library' };
+        const [old] = this.rows('select bytes from extraction where schema_name = ? collate nocase and item_id = ?', s.name, id);
+        const total = this.size();
+        if (total - (old?.bytes || 0) + bytes > this.limits.customerBytes) return { reason: 'the library is full' };
+        this.rows('insert into extraction (schema_name, item_id, result, bytes, updated_at) values (?, ?, ?, ?, ?)'
+          + ' on conflict(schema_name, item_id) do update set result = excluded.result, bytes = excluded.bytes,'
+          + ' updated_at = excluded.updated_at', s.name, id, result, bytes, now());
+        this.total = total - (old?.bytes || 0) + bytes;
+        return { created: !old };
+      });
+      if (outcome.reason) rejected.push({ item_id: id, reason: outcome.reason });
+      else saved.push({ item_id: id, created: outcome.created });
+    }
+    const after = this.schemaRow(s.name);
+    return json(200, { saved, rejected, extracted: after.extracted, remaining: after.remaining, rows_written: this.written });
+  }
+
+  extractionList(p) {
+    const s = this.schemaRow(folderName(p.get('name')));
+    if (!s) return fail(404, 'no such schema in this library');
+    const limit = Math.min(Math.max(Number(p.get('limit')) || 25, 1), 100);
+    const before = Number(p.get('before')) || Number.MAX_SAFE_INTEGER;
+    const rows = this.rows('select e.item_id, i.url, i.author, i.title, i.published_at, e.result, e.updated_at'
+      + ' from extraction e join item i on i.id = e.item_id where e.schema_name = ? collate nocase and e.item_id < ?'
+      + ' order by e.item_id desc limit ?', s.name, before, limit);
+    const results = rows.map((r) => ({ ...r, result: parseKept(r.result) }));
+    const next = results.length === limit ? results[results.length - 1].item_id : null;
+    return json(200, { schema: s.name, results, extracted: s.extracted, ...(next ? { next_before: next } : {}) });
   }
 
   async save(body) {
@@ -382,7 +530,8 @@ export class Library {
     if (remove) {
       this.size();
       this.rows('delete from item where id = ?', item.id);
-      this.total -= item.bytes;
+      // Its schema results went with it (trigger item_ad_extraction): count anew.
+      this.total = null;
       return json(200, { deleted: { id: item.id, url: item.url } });
     }
     const { bytes, sha, segments, meta, ...rest } = item;
