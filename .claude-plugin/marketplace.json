@@ -7,6 +7,7 @@
   "plugins": [
     {
       "name": "awg-smtranscript",
+      "displayName": "AWG Social Media",
       "source": "./",
       "description": "Transcripts from YouTube, TikTok and Instagram. Runs locally, no API key; WARP for YouTube bulk, Whisper in Docker for TikTok and Instagram."
     }
