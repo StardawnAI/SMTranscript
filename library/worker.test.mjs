@@ -317,3 +317,77 @@ test('one text is moved, a whole folder is renamed', async () => {
   assert.equal((await call('POST', '/v1/move', { key, body: { url: 'https://nope.example/x', folder: 'X' } })).status, 404);
   assert.equal((await call('POST', '/v1/move', { key, body: { id: 1 } })).status, 400);
 });
+
+const SCHEMA_DEF = {
+  idea: 'string', legal_basis: [{ law: 'string', section: 'string' }], who: ['alleine', 'ehepartner_noetig', 'gmbh'],
+};
+
+test('a schema hands out the folder\'s texts without a result, oldest first, until every one has one', async () => {
+  const { call, customer } = stack();
+  const { key } = await customer('Kunde A');
+  const immo = [1, 2, 3].map((n) => ({ ...reel(n, `Tipp ${n}: Spekulationsfrist nach zehn Jahren`), folder: 'Immobilien' }));
+  await call('POST', '/v1/items', { key, body: { items: [...immo, reel(9, 'Anderes Thema')] } });
+  const made = await call('POST', '/v1/schemas', { key, body: { name: 'Invest-Ideen', folder: 'immobilien', definition: SCHEMA_DEF } });
+  assert.equal(made.status, 200);
+  assert.equal(made.data.schema.folder, 'Immobilien');
+  assert.deepEqual([made.data.schema.texts, made.data.schema.extracted, made.data.schema.remaining], [3, 0, 3]);
+
+  const first = (await call('GET', '/v1/schema/next?name=invest-ideen&limit=2', { key })).data;
+  assert.deepEqual(first.schema.definition, SCHEMA_DEF);
+  assert.deepEqual(first.items.map((i) => i.text.slice(0, 6)), ['Tipp 1', 'Tipp 2']);
+  const saved = await call('POST', '/v1/extractions', { key, body: { schema: 'Invest-Ideen', results: first.items.map((i) => ({
+    item_id: i.id, result: { idea: `Idee ${i.id}`, legal_basis: [{ law: 'EStG', section: '§ 23' }], who: 'alleine' },
+  })) } });
+  assert.deepEqual([saved.data.saved.length, saved.data.extracted, saved.data.remaining], [2, 2, 1]);
+
+  const next = (await call('GET', '/v1/schema/next?name=Invest-Ideen', { key })).data;
+  assert.deepEqual(next.items.map((i) => i.text.slice(0, 6)), ['Tipp 3']);
+  const results = (await call('GET', '/v1/extractions?name=Invest-Ideen', { key })).data;
+  assert.equal(results.results.length, 2);
+  assert.equal(results.results[0].result.legal_basis[0].section, '§ 23');
+  assert.equal(results.results[0].url, immo[1].url);
+});
+
+test('saving a result twice keeps one; results go when their text or their schema goes', async () => {
+  const { call, customer } = stack();
+  const { key } = await customer('Kunde A');
+  await call('POST', '/v1/items', { key, body: { items: [{ ...reel(1, 'Tipp'), folder: 'Immo' }, { ...reel(2, 'Tipp zwei'), folder: 'Immo' }] } });
+  await call('POST', '/v1/schemas', { key, body: { name: 'S', folder: 'Immo', definition: 'Pull out the idea.' } });
+  const save = (id, result) => call('POST', '/v1/extractions', { key, body: { schema: 'S', results: [{ item_id: id, result }] } });
+  assert.equal((await save(1, 'erste Fassung')).data.saved[0].created, true);
+  assert.equal((await save(1, 'zweite Fassung')).data.saved[0].created, false);
+  await save(2, { idea: 'b' });
+  let list = (await call('GET', '/v1/extractions?name=S', { key })).data.results;
+  assert.deepEqual(list.map((r) => r.result), [{ idea: 'b' }, 'zweite Fassung']);
+
+  await call('DELETE', '/v1/item?id=2', { key });
+  list = (await call('GET', '/v1/extractions?name=S', { key })).data.results;
+  assert.deepEqual(list.map((r) => r.item_id), [1]);
+  const gone = await call('DELETE', '/v1/schema?name=S', { key });
+  assert.deepEqual(gone.data, { deleted: 'S', results_deleted: 1 });
+  assert.equal((await call('GET', '/v1/extractions?name=S', { key })).status, 404);
+  assert.equal((await call('GET', '/v1/schemas', { key })).data.schemas.length, 0);
+});
+
+test('schemas and results are refused with a reason when broken, too big or foreign', async () => {
+  const { call, customer } = stack();
+  const a = await customer('Kunde A');
+  const b = await customer('Kunde B');
+  await call('POST', '/v1/items', { key: a.key, body: { items: [{ ...reel(1, 'Tipp'), folder: 'Immo' }] } });
+  assert.equal((await call('POST', '/v1/schemas', { key: a.key, body: { folder: 'Immo', definition: 'x' } })).status, 400);
+  assert.equal((await call('POST', '/v1/schemas', { key: a.key, body: { name: 'S', definition: 'x' } })).status, 400);
+  assert.equal((await call('POST', '/v1/schemas', { key: a.key, body: { name: 'S', folder: 'Immo' } })).status, 400);
+  assert.equal((await call('POST', '/v1/schemas', { key: a.key, body: { name: 'S', folder: 'Immo', definition: 'x'.repeat(20001) } })).status, 400);
+  await call('POST', '/v1/schemas', { key: a.key, body: { name: 'S', folder: 'Immo', definition: 'x' } });
+  const r = await call('POST', '/v1/extractions', { key: a.key, body: { schema: 'S', results: [
+    { item_id: 1, result: 'x'.repeat(20001) }, { item_id: 777, result: 'y' }, { result: 'z' }, { item_id: 1 },
+  ] } });
+  assert.equal(r.data.saved.length, 0);
+  assert.deepEqual(r.data.rejected.map((x) => x.reason), [
+    'result over 20000 bytes', 'no such text in this library', 'item_id is required', 'result is required',
+  ]);
+  assert.equal((await call('POST', '/v1/extractions', { key: a.key, body: { schema: 'S', results: [] } })).status, 400);
+  // Another customer neither sees the schema nor writes to it.
+  assert.equal((await call('GET', '/v1/schema?name=S', { key: b.key })).status, 404);
+  assert.equal((await call('POST', '/v1/extractions', { key: b.key, body: { schema: 'S', results: [{ item_id: 1, result: 'x' }] } })).status, 404);
+});

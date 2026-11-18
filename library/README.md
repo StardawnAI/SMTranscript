@@ -24,7 +24,6 @@ outside the repository.
    over a private channel; it is not shown again.
 
 2. The customer gives the SMTranscript server the two variables, then restarts the app:
-
    - Claude Code with the `awg-smtranscript` plugin: in the `env` block of
      `~/.claude/settings.json`:
 
@@ -84,18 +83,34 @@ folder that exists keeps its spelling. `GET /v1/folders` lists them with counts,
 `POST /v1/move {id|url, to}` moves one text, `POST /v1/move {from, to}` renames a
 folder (into an existing one: merged). A move rewrites the row only, not the search index.
 
+## Schemas
+
+A schema says what to pull out of every text of one folder: a flat list of fields or a deep
+structure with categories and fixed choices. The model the customer chats with (their own
+Claude or ChatGPT, decision SA-D7) does the extracting; no model runs here. The MCP tools
+`schema_save`, `schema_next`, `schema_results_save`, `schema_results`, `schema_list` and
+`schema_delete` carry the loop: save the schema, take the texts that still lack a result,
+extract, keep the results, until `remaining` is 0. Results count toward the library's size
+and go with their text or their schema.
+
 ## API
 
 Customer routes take `Authorization: Bearer sml_...`:
 
-| Route                                            | What it does                                                                                                                                                                                                                                     |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `POST /v1/items` | Keeps 1 to 50 items `{url, text, platform, kind, external_id, title, author, published_at, duration_seconds, language, segments, meta}`. The same `url` again replaces its item; the same content again writes nothing and answers `unchanged: true`. Answers `{saved, rejected, rows_written}`, each rejected item with its reason |
-| `GET /v1/items?platform=&author=&limit=&before=` | Lists items newest first, without their text; `next_before` pages on                                                                                                                                                                             |
-| `GET /v1/item?id=`, `?url=` or `?platform=&external_id=` | One item in full |
-| `DELETE /v1/item?id=`, `?url=` or `?platform=&external_id=` | Deletes one item |
-| `GET /v1/search?q=&platform=&limit=`             | Full-text search; every word is a quoted prefix term, so no input is read as FTS5 syntax                                                                                                                                                         |
-| `GET /v1/usage` | Items, bytes of content, `database_bytes` (the size Cloudflare bills), requests today and the limits |
+| Route                                                           | What it does                                                                                                                                                                                                                                                                                                                        |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/items`                                                | Keeps 1 to 50 items `{url, text, platform, kind, external_id, title, author, published_at, duration_seconds, language, segments, meta}`. The same `url` again replaces its item; the same content again writes nothing and answers `unchanged: true`. Answers `{saved, rejected, rows_written}`, each rejected item with its reason |
+| `GET /v1/items?platform=&author=&limit=&before=`                | Lists items newest first, without their text; `next_before` pages on                                                                                                                                                                                                                                                                |
+| `GET /v1/item?id=`, `?url=` or `?platform=&external_id=`        | One item in full                                                                                                                                                                                                                                                                                                                    |
+| `DELETE /v1/item?id=`, `?url=` or `?platform=&external_id=`     | Deletes one item                                                                                                                                                                                                                                                                                                                    |
+| `GET /v1/search?q=&platform=&limit=`                            | Full-text search; every word is a quoted prefix term, so no input is read as FTS5 syntax                                                                                                                                                                                                                                            |
+| `GET /v1/usage`                                                 | Items, bytes of content, `database_bytes` (the size Cloudflare bills), requests today and the limits                                                                                                                                                                                                                                |
+| `POST /v1/schemas` `{name, folder, definition, description}`    | Creates or changes an extraction schema for one folder; `definition` is a JSON object or plain instructions, up to 20000 characters                                                                                                                                                                                                 |
+| `GET /v1/schemas`                                               | The schemas, each with `texts`, `extracted` and `remaining`                                                                                                                                                                                                                                                                         |
+| `GET /v1/schema?name=`, `DELETE /v1/schema?name=`               | One schema with its definition; deleting it deletes its results, not the texts                                                                                                                                                                                                                                                      |
+| `GET /v1/schema/next?name=&limit=&max_chars=`                   | The folder's next texts without a result, oldest first (default 20 texts / 60000 characters, at least one)                                                                                                                                                                                                                          |
+| `POST /v1/extractions` `{schema, results: [{item_id, result}]}` | Keeps 1 to 50 results, one per text, up to 20000 bytes each; the same text again replaces its result                                                                                                                                                                                                                                |
+| `GET /v1/extractions?name=&limit=&before=`                      | The results, newest text first, with the text's link, author and date                                                                                                                                                                                                                                                               |
 
 Operator routes take `Authorization: Bearer <admin token>`:
 
@@ -125,22 +140,22 @@ Measured on 2026-11-11 against the deployed worker with 100 real reel transcript
 (1,176 characters of text on average, with timed segments), and confirmed by Cloudflare's
 own analytics for that hour (446 rows written):
 
-| Per reel | Measured |
-| --- | --- |
-| Rows written, new reel | 4 |
-| Rows written, same reel again | 0 |
-| Rows written, changed text | 4 |
-| Database size | about 5.5 KB (552,960 bytes for 100) |
-| Active time per request | about 10 ms |
+| Per reel                      | Measured                             |
+| ----------------------------- | ------------------------------------ |
+| Rows written, new reel        | 4                                    |
+| Rows written, same reel again | 0                                    |
+| Rows written, changed text    | 4                                    |
+| Database size                 | about 5.5 KB (552,960 bytes for 100) |
+| Active time per request       | about 10 ms                          |
 
 Cloudflare's prices on Workers Paid (USD 5 a month, checked 2026-11-11):
 
-| | Included a month | Beyond |
-| --- | --- | --- |
-| Durable Object rows written | 50 million | USD 1.00 per million |
-| Durable Object storage | 5 GB | USD 0.20 per GB |
-| Durable Object requests | 1 million | USD 0.15 per million |
-| Worker requests | 10 million | USD 0.30 per million |
+|                             | Included a month | Beyond               |
+| --------------------------- | ---------------- | -------------------- |
+| Durable Object rows written | 50 million       | USD 1.00 per million |
+| Durable Object storage      | 5 GB             | USD 0.20 per GB      |
+| Durable Object requests     | 1 million        | USD 0.15 per million |
+| Worker requests             | 10 million       | USD 0.30 per million |
 
 A new reel costs two requests (look up, keep) and 4 rows. A million new reels a month are
 4 million rows and 2 million requests of each kind: inside the included amounts but for
