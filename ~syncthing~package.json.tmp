@@ -1,0 +1,50 @@
+{
+  "name": "smtranscript",
+  "version": "3.7.0",
+  "description": "MCP server for transcripts: YouTube (one video, a playlist, search results; no API key, Cloudflare WARP for bulk) TikTok and Instagram (videos and accounts, transcribed with Whisper in a Docker worker), Vimeo videos (captions first) and the pictures of Instagram posts.",
+  "type": "module",
+  "bin": {
+    "smtranscript": "bin/smtranscript.mjs",
+    "youtube-transcript-mcp": "bin/youtube-transcript-mcp.mjs"
+  },
+  "exports": {
+    ".": "./src/youtube.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "worker/smt",
+    "worker/Dockerfile",
+    "worker/.dockerignore",
+    "worker/requirements.txt",
+    "worker/requirements.lock",
+    "worker/requirements-cuda.txt",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "youtube",
+    "transcript",
+    "captions",
+    "cloudflare-warp",
+    "tiktok",
+    "instagram",
+    "whisper",
+    "yt-dlp"
+  ],
+  "homepage": "https://github.com/StardawnAI/SMTranscript",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/StardawnAI/SMTranscript.git"
+  },
+  "author": "Stardawn AI (https://stardawnai.com)",
+  "license": "MIT"
+}
