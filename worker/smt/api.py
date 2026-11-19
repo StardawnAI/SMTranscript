@@ -1,7 +1,10 @@
 """The HTTP interface: small, and the same for the MCP server and StarBase.
 
   POST /v1/jobs                      a video link            -> 202 {job_id}
-                                     ({"kind": "images"}: the text on a picture post's pictures)
+                                     ({"kind": "images"}: the text on a picture post's pictures;
+                                      {"kind": "download"}: the whole video behind a one-hour link,
+                                      also YouTube; the result carries download: {url, expires_at,
+                                      filename, size, title})
   POST /v1/profile-imports           an account link + limit -> 202 {job_id}
   GET  /v1/jobs/{id}                 status, error class, when to ask again
   GET  /v1/jobs/{id}/result          the transcript and the stored files, or 202 while not done
@@ -93,7 +96,8 @@ def make_handler(engine: Engine):
             try:
                 if method == "POST" and path == "/v1/jobs":
                     body = self._body()
-                    submit = engine.submit_images if body.get("kind") == "images" else engine.submit_video
+                    submit = {"images": engine.submit_images, "download": engine.submit_download}.get(
+                        body.get("kind"), engine.submit_video)
                     job, existing = submit(key.tenant, str(body.get("url") or ""), body, body.get("idempotency_key"))
                     return self._send(200 if existing else 202, {**engine.status(job), "existing": existing})
                 if method == "POST" and path == "/v1/profile-imports":

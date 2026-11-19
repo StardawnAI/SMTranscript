@@ -1,4 +1,5 @@
-"""What may come in: links to TikTok, Instagram and Vimeo, nothing else.
+"""What may come in: links to TikTok, Instagram and Vimeo, and YouTube videos
+for downloads, nothing else.
 
 A job service that fetches whatever URL it is handed is a way into the network
 it runs in. So the input is matched against the two platforms' own hosts, a
@@ -16,12 +17,14 @@ import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}
 INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "m.instagram.com", "instagr.am", "www.instagr.am"}
 VIMEO_HOSTS = {"vimeo.com", "www.vimeo.com", "player.vimeo.com"}
-HOSTS = TIKTOK_HOSTS | INSTAGRAM_HOSTS | VIMEO_HOSTS
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+HOSTS = TIKTOK_HOSTS | INSTAGRAM_HOSTS | VIMEO_HOSTS | YOUTUBE_HOSTS
+_YT_ID = r"[A-Za-z0-9_-]{11}"
 
 # Instagram paths that are not account names.
 _IG_RESERVED = {"p", "reel", "reels", "tv", "stories", "explore", "accounts", "share", "direct", "about", "legal"}
@@ -33,7 +36,7 @@ class InputError(ValueError):
 
 @dataclass(frozen=True)
 class Target:
-    platform: str  # tiktok | instagram | vimeo
+    platform: str  # tiktok | instagram | vimeo | youtube
     kind: str  # video | profile | short
     platform_id: str | None  # video id / shortcode, or the account name for a profile
     canonical_url: str
@@ -47,8 +50,22 @@ def _clean(url: str) -> tuple[str, str]:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if host not in HOSTS:
-        raise InputError(f"not a TikTok, Instagram or Vimeo link: {host or url!r}")
+        raise InputError(f"not a TikTok, Instagram, Vimeo or YouTube link: {host or url!r}")
     return host, parsed.path
+
+
+def _youtube(host: str, url: str, path: str) -> Target:
+    """Single videos only (watch?v=, youtu.be/, shorts/, live/); channels and
+    playlists are not taken."""
+    if host == "youtu.be":
+        m = re.match(rf"^/({_YT_ID})/?$", path)
+    elif path.rstrip("/") == "/watch":
+        m = re.fullmatch(f"({_YT_ID})", parse_qs(urlparse(url.strip()).query).get("v", [""])[0])
+    else:
+        m = re.match(rf"^/(?:shorts|live)/({_YT_ID})/?$", path)
+    if not m:
+        raise InputError(f"no YouTube video in {url!r} (channels and playlists are not taken)")
+    return Target("youtube", "video", m.group(1), f"https://www.youtube.com/watch?v={m.group(1)}")
 
 
 def _vimeo(host: str, url: str, path: str) -> Target:
@@ -76,6 +93,8 @@ def parse(url: str) -> Target:
     host, path = _clean(url)
     if host in VIMEO_HOSTS:
         return _vimeo(host, url, path)
+    if host in YOUTUBE_HOSTS:
+        return _youtube(host, url, path)
     if host in TIKTOK_HOSTS:
         if host in ("vm.tiktok.com", "vt.tiktok.com") or path.startswith("/t/"):
             return Target("tiktok", "short", None, f"https://{host}{path}")

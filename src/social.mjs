@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { readConfig, writeConfig } from './config.mjs';
 import { warpRunFlags } from './warp.mjs';
 import { postRecord, socialRecord } from './library.mjs';
+import { parseVideoId } from './youtube.mjs';
 
 export const WORKER_VERSION = '1.3.1';
 export const WORKER = 'smtranscript-worker';
@@ -86,6 +87,22 @@ export function parseSocialLink(input) {
     }
   }
   return null;
+}
+
+// The links download_video takes: the social videos above, and a YouTube video
+// (watch, youtu.be, shorts, live). A playlist, a channel or a bare ID is not one.
+export function parseDownloadLink(input) {
+  const social = parseSocialLink(input);
+  if (social) return social.kind === 'video' ? social : null;
+  let url;
+  try {
+    url = new URL(/^https?:\/\//i.test(input) ? input : `https://${input}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.toLowerCase();
+  if (!/(^|\.)youtube\.com$/.test(host) && host !== 'youtu.be') return null;
+  return parseVideoId(url.href) ? { platform: 'youtube', kind: 'video' } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +491,71 @@ export async function runSocialTool(args, { notify = () => {}, caller = null } =
     ...(parent?.warnings?.length ? { warnings: parent.warnings } : {}),
     ...(inline ? {} : { savedTo: dir, files: '<platform>_<videoId>.txt' }),
     videos,
+  };
+}
+
+const DOWNLOAD_NOTE = 'The link works for one hour; then the file is deleted on our side.';
+
+// A video as a file: the worker downloads it, puts it behind a public link and
+// deletes it again one hour after it is ready. Nothing is kept here, and there is
+// no text, so nothing goes to the library.
+export async function runDownloadTool(args, { notify = () => {} } = {}, deps = {}) {
+  const input = String(args.url || '').trim();
+  if (!input) throw new Error('url is required');
+  if (!parseDownloadLink(input)) {
+    throw new Error(`"${input}" is not a YouTube, TikTok, Instagram or Vimeo video link. Use a link to one video (youtube.com/watch?v=…, youtu.be/…, /shorts/…, /live/…, tiktok.com/@user/video/…, instagram.com/reel/…, vimeo.com/…).`);
+  }
+  const route = args.route || 'direct';
+  if (!['direct', 'warp'].includes(route)) throw new Error('route is "direct" or "warp"');
+  const worker = deps.worker || (await ensureWorker({ notify }));
+  if (route === 'warp') await (deps.ensureWarp || ensureWarp)({ notify });
+  const api = deps.api || client(worker);
+  // One job per link: a second call while the first still works finds it, and so
+  // does one while its link is live. The worker fetches the video anew once the link
+  // has run out or nearly (five minutes or less left), so a dead link is never handed out.
+  const job = await api.submit({ url: input, kind: 'download', route, priority: 'high', idempotency_key: `download:${input}` });
+  notify(job.existing ? `${job.job_id}: already known, reusing it` : `${job.job_id}: queued`);
+  const wait = { notify, ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}), ...(deps.seconds ? { seconds: deps.seconds } : {}) };
+  const result = await waitResult(api, job.job_id, wait);
+  if (!result) {
+    return { status: 'running', jobId: job.job_id, message: 'Still working. Call again with the same link: the job keeps running and its result is reused, nothing is downloaded twice.' };
+  }
+  if (result.status === 'failed' || result.status === 'cancelled') throw failure(result);
+  const d = result.download;
+  if (!d?.url) throw new Error(`${result.media?.canonical_url || result.job_id}: the worker finished without a download link`);
+  return {
+    url: d.url,
+    expires_at: d.expires_at,
+    filename: d.filename,
+    size: d.size,
+    title: d.title ?? result.media?.title ?? null,
+    note: DOWNLOAD_NOTE,
+  };
+}
+
+export function downloadTool() {
+  return {
+    name: 'download_video',
+    description: `Download a video as a file: a YouTube, TikTok, Instagram or Vimeo video link in, a download link out.
+
+The answer has url, expires_at, filename (an mp4), size (bytes) and title. Give the url to the user in your reply so they click it and the browser downloads the file. It is a public link, valid for ONE HOUR from the moment it is ready; after that the file is deleted on our side automatically, and nobody can extend it. The video is not kept anywhere else, so for a second copy later ask again. You cannot open or watch the file yourself: for what is said in a video use get_youtube_transcript or get_social_transcript.
+
+A long video can take a few minutes. A call that runs out of time answers status "running": call again with the same link, nothing is downloaded twice.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'One video: youtube.com/watch?v=…, youtu.be/…, youtube.com/shorts/…, youtube.com/live/…, tiktok.com/@user/video/…, vm.tiktok.com/…, instagram.com/reel/…, /p/…, vimeo.com/….' },
+        route: { type: 'string', enum: ['direct', 'warp'], description: 'How to reach the platform. Default "direct"; "warp" goes through Cloudflare WARP.' },
+      },
+      required: ['url'],
+    },
+    annotations: {
+      title: 'Download a video',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
   };
 }
 

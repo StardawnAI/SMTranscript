@@ -3,8 +3,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import worker, { Library, ftsQuery, normalize } from './worker.mjs';
-import { cloudflareEnv, storage } from './fake-cloudflare.mjs';
+import worker, { Library, MAX_DOWNLOAD_BYTES, PART_SIZE, byteRange, downloadName, ftsQuery, normalize } from './worker.mjs';
+import { cloudflareEnv, fireAlarms, storage } from './fake-cloudflare.mjs';
 
 function stack(vars = {}) {
   const env = cloudflareEnv(vars);
@@ -390,4 +390,216 @@ test('schemas and results are refused with a reason when broken, too big or fore
   // Another customer neither sees the schema nor writes to it.
   assert.equal((await call('GET', '/v1/schema?name=S', { key: b.key })).status, 404);
   assert.equal((await call('POST', '/v1/extractions', { key: b.key, body: { schema: 'S', results: [{ item_id: 1, result: 'x' }] } })).status, 404);
+});
+
+// Downloads: the upload token puts a file into R2 in parts, the link serves it
+// for one hour, the Downloads object's alarm deletes it after that.
+function downloadStack(vars = {}) {
+  const env = cloudflareEnv(vars);
+  const send = (method, path, { token = env.UPLOAD_TOKEN, body, bytes, headers = {} } = {}) => worker.fetch(new Request(`https://library.test${path}`, {
+    method,
+    headers: {
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(bytes ? { 'content-length': String(bytes.length) } : body !== undefined ? { 'content-type': 'application/json' } : {}),
+      ...headers,
+    },
+    ...(bytes ? { body: bytes } : body !== undefined ? { body: JSON.stringify(body) } : {}),
+  }), env);
+  const call = async (method, path, options) => {
+    const r = await send(method, path, options);
+    return { status: r.status, data: await r.json() };
+  };
+  const create = (body) => call('POST', '/v1/downloads', { body: { filename: 'clip.mp4', mime: 'video/mp4', title: 'A clip',
+    source_url: 'https://www.youtube.com/watch?v=abc', ...body } });
+  const rows = () => env.DOWNLOAD_INDEX.get('downloads').rows('select * from download order by created_at');
+  return { env, send, call, create, rows, alarms: () => fireAlarms(env.DOWNLOAD_INDEX) };
+}
+
+const START = Date.parse('2026-11-19T10:00:00Z');
+const filled = (length, seed) => {
+  const bytes = new Uint8Array(length);
+  for (let i = 0; i < length; i += 1) bytes[i] = (i * 7 + seed) % 251;
+  return bytes;
+};
+
+test('a file goes up in parts, its link serves it with ranges for one hour, then the alarm deletes it', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: START });
+  const { env, send, call, create, alarms } = downloadStack();
+  const size = PART_SIZE + 1000;
+  const made = await create({ filename: 'Mein Video – Teil 1.mp4', size });
+  assert.equal(made.status, 200);
+  assert.match(made.data.id, /^[a-f0-9]{32}$/);
+  assert.equal(made.data.part_size, PART_SIZE);
+  assert.equal(made.data.parts, 2);
+  const { id } = made.data;
+  const first = filled(PART_SIZE, 1);
+  const last = filled(1000, 2);
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/1`, { bytes: first })).status, 200);
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/2`, { bytes: last })).status, 200);
+  const done = await call('POST', `/v1/downloads/${id}/complete`);
+  assert.equal(done.status, 200);
+  assert.equal(done.data.url, `https://library.test/d/${id}/Mein_Video_Teil_1.mp4`);
+  assert.equal(done.data.expires_at, new Date(START + 3600 * 1000).toISOString());
+  assert.equal(done.data.size, size);
+  assert.equal(done.data.title, 'A clip');
+  // A retried complete hands out the same link.
+  assert.equal((await call('POST', `/v1/downloads/${id}/complete`)).data.url, done.data.url);
+  const path = new URL(done.data.url).pathname;
+
+  // The link needs no token.
+  const whole = await send('GET', path, { token: null });
+  assert.equal(whole.status, 200);
+  assert.equal(whole.headers.get('content-type'), 'video/mp4');
+  assert.equal(whole.headers.get('content-disposition'), 'attachment; filename="Mein_Video_Teil_1.mp4"');
+  assert.equal(whole.headers.get('accept-ranges'), 'bytes');
+  assert.equal(whole.headers.get('content-length'), String(size));
+  const body = new Uint8Array(await whole.arrayBuffer());
+  assert.equal(body.length, size);
+  assert.deepEqual(body.subarray(PART_SIZE - 3, PART_SIZE + 3), new Uint8Array([...first.subarray(-3), ...last.subarray(0, 3)]));
+
+  const range = await send('GET', path, { token: null, headers: { range: `bytes=${PART_SIZE - 2}-${PART_SIZE + 1}` } });
+  assert.equal(range.status, 206);
+  assert.equal(range.headers.get('content-range'), `bytes ${PART_SIZE - 2}-${PART_SIZE + 1}/${size}`);
+  assert.deepEqual(new Uint8Array(await range.arrayBuffer()), new Uint8Array([...first.subarray(-2), ...last.subarray(0, 2)]));
+  const tail = await send('GET', path, { token: null, headers: { range: 'bytes=-5' } });
+  assert.equal(tail.status, 206);
+  assert.deepEqual(new Uint8Array(await tail.arrayBuffer()), last.subarray(-5));
+  const outside = await send('GET', path, { token: null, headers: { range: `bytes=${size}-` } });
+  assert.equal(outside.status, 416);
+  assert.equal(outside.headers.get('content-range'), `bytes */${size}`);
+  const head = await send('HEAD', path, { token: null });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get('content-length'), String(size));
+
+  // A second before the hour is over it still works; the alarm waits for its time.
+  t.mock.timers.tick(3599 * 1000);
+  await alarms();
+  assert.equal((await send('GET', path, { token: null, headers: { range: 'bytes=0-0' } })).status, 206);
+  t.mock.timers.tick(1000);
+  assert.equal((await send('GET', path, { token: null })).status, 410, 'expired before the alarm runs');
+  await alarms();
+  assert.equal(env.DOWNLOADS.objects.size, 0, 'the file left R2');
+  assert.equal((await send('GET', path, { token: null })).status, 410);
+  assert.equal((await send('HEAD', path, { token: null })).status, 410);
+  // Nothing extends it: completing again does not bring it back.
+  assert.equal((await call('POST', `/v1/downloads/${id}/complete`)).status, 409);
+  assert.equal(await env.DOWNLOAD_INDEX.get('downloads').ctx.storage.getAlarm(), null, 'nothing left to wait for');
+});
+
+test('the upload routes need the upload token and refuse to run without one', async () => {
+  const { call, create, send } = downloadStack();
+  assert.equal((await call('POST', '/v1/downloads', { token: null, body: { filename: 'a.mp4', size: 10 } })).status, 401);
+  assert.equal((await call('POST', '/v1/downloads', { token: 'w'.repeat(40), body: { filename: 'a.mp4', size: 10 } })).status, 401);
+  assert.equal((await call('POST', '/v1/downloads', { token: 'sml_x', body: { filename: 'a.mp4', size: 10 } })).status, 401);
+  const { id } = (await create({ size: 10 })).data;
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/1`, { token: 'w'.repeat(40), bytes: filled(10, 0) })).status, 401);
+  assert.equal((await call('POST', `/v1/downloads/${id}/complete`, { token: null })).status, 401);
+  assert.equal((await call('POST', `/v1/downloads/${id}/abort`, { token: null })).status, 401);
+  assert.equal((await send('GET', '/v1/downloads', {})).status, 404);
+  const unset = downloadStack({ UPLOAD_TOKEN: '' });
+  assert.equal((await unset.call('POST', '/v1/downloads', { token: 'u'.repeat(40), body: { filename: 'a.mp4', size: 10 } })).status, 503);
+});
+
+test('the ceilings hold: 4 GiB a file, 100 GiB stored at once', async () => {
+  const { create, call } = downloadStack();
+  assert.equal((await create({ size: MAX_DOWNLOAD_BYTES + 1 })).status, 413);
+  for (const size of [0, -1, 1.5, 'big', null]) assert.equal((await create({ size })).status, 400, `size ${size}`);
+  const ids = [];
+  for (let i = 0; i < 25; i += 1) {
+    const r = await create({ size: MAX_DOWNLOAD_BYTES });
+    assert.equal(r.status, 200, `file ${i + 1}`);
+    ids.push(r.data.id);
+  }
+  const full = await create({ size: 1 });
+  assert.equal(full.status, 507);
+  assert.match(full.data.error, /full/);
+  // An aborted upload frees its room.
+  assert.equal((await call('POST', `/v1/downloads/${ids[0]}/abort`)).status, 200);
+  assert.equal((await create({ size: 1 })).status, 200);
+});
+
+test('parts must be the right size and all there before complete', async () => {
+  const { call, create } = downloadStack();
+  const { id } = (await create({ size: PART_SIZE + 10 })).data;
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/2`, { bytes: filled(9, 0) })).status, 400);
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/3`, { bytes: filled(10, 0) })).status, 400);
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/0`, { bytes: filled(10, 0) })).status, 400);
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/2`, { bytes: filled(10, 0) })).status, 200);
+  const early = await call('POST', `/v1/downloads/${id}/complete`);
+  assert.equal(early.status, 409);
+  assert.match(early.data.error, /parts missing: 1/);
+  assert.equal((await call('PUT', `/v1/downloads/${'0'.repeat(32)}/parts/1`, { bytes: filled(10, 0) })).status, 404);
+  assert.equal((await call('POST', `/v1/downloads/${'0'.repeat(32)}/complete`)).status, 404);
+});
+
+test('an aborted upload leaves nothing in R2 and takes no more parts', async () => {
+  const { env, call, create, send, rows } = downloadStack();
+  const { id } = (await create({ size: 20 })).data;
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/1`, { bytes: filled(20, 0) })).status, 200);
+  assert.equal((await call('POST', `/v1/downloads/${id}/abort`)).status, 200);
+  assert.equal((await call('POST', `/v1/downloads/${id}/abort`)).status, 200, 'aborting twice is fine');
+  assert.equal([...env.DOWNLOADS.uploads.values()][0].state, 'aborted');
+  assert.equal(env.DOWNLOADS.objects.size, 0);
+  assert.equal(rows()[0].state, 'aborted');
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/1`, { bytes: filled(20, 0) })).status, 409);
+  assert.equal((await call('POST', `/v1/downloads/${id}/complete`)).status, 409);
+  assert.equal((await send('GET', `/d/${id}/clip.mp4`, { token: null })).status, 404);
+});
+
+test('an upload not completed within the hour is aborted by the alarm', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: START });
+  const { env, call, create, rows, alarms } = downloadStack();
+  const { id } = (await create({ size: 20 })).data;
+  assert.equal(await env.DOWNLOAD_INDEX.get('downloads').ctx.storage.getAlarm(), START + 3600 * 1000);
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/1`, { bytes: filled(20, 0) })).status, 200);
+  t.mock.timers.tick(3600 * 1000);
+  assert.equal((await call('POST', `/v1/downloads/${id}/complete`)).status, 410, 'too late even before the alarm');
+  await alarms();
+  assert.equal(rows()[0].state, 'aborted');
+  assert.equal([...env.DOWNLOADS.uploads.values()][0].state, 'aborted');
+  assert.equal(env.DOWNLOADS.objects.size, 0);
+  assert.equal((await call('PUT', `/v1/downloads/${id}/parts/1`, { bytes: filled(20, 0) })).status, 409);
+});
+
+test('a link with a wrong id or file name finds nothing', async () => {
+  const { call, create, send } = downloadStack();
+  const { id } = (await create({ size: 5, filename: 'clip.mp4' })).data;
+  await call('PUT', `/v1/downloads/${id}/parts/1`, { bytes: filled(5, 0) });
+  await call('POST', `/v1/downloads/${id}/complete`);
+  assert.equal((await send('GET', `/d/${id}/clip.mp4`, { token: null })).status, 200);
+  assert.equal((await send('GET', `/d/${id}/other.mp4`, { token: null })).status, 404);
+  assert.equal((await send('GET', `/d/${'0'.repeat(32)}/clip.mp4`, { token: null })).status, 404);
+  assert.equal((await send('GET', `/d/${id}/%E0%A4%A`, { token: null })).status, 404);
+  assert.equal((await send('GET', '/d/short/clip.mp4', { token: null })).status, 404);
+  assert.equal((await send('DELETE', `/d/${id}/clip.mp4`, { token: null })).status, 405);
+});
+
+test('file names become safe ASCII with their extension, up to 150 characters', () => {
+  assert.equal(downloadName('Mein Video – Teil 1.mp4'), 'Mein_Video_Teil_1.mp4');
+  assert.equal(downloadName('Café "über" <alles>.MP4'), 'Cafe_uber_alles.MP4');
+  assert.equal(downloadName('../../etc/passwd'), 'passwd');
+  assert.equal(downloadName('C:\\Videos\\clip.mp4'), 'clip.mp4');
+  assert.equal(downloadName('日本語.webm'), 'download.webm');
+  assert.equal(downloadName(''), 'download');
+  assert.equal(downloadName(undefined), 'download');
+  assert.equal(downloadName('.hidden'), 'hidden');
+  assert.equal(downloadName('noext'), 'noext');
+  const long = downloadName(`${'a'.repeat(300)}.mp4`);
+  assert.equal(long.length, 150);
+  assert.ok(long.endsWith('.mp4'));
+  assert.match(downloadName('x\r\n";filename=evil.exe .mp4'), /^[A-Za-z0-9._-]+$/);
+});
+
+test('byte ranges are read as R2 takes them', () => {
+  assert.deepEqual(byteRange('bytes=0-9', 100), { offset: 0, length: 10 });
+  assert.deepEqual(byteRange('bytes=90-', 100), { offset: 90, length: 10 });
+  assert.deepEqual(byteRange('bytes=95-200', 100), { offset: 95, length: 5 });
+  assert.deepEqual(byteRange('bytes=-10', 100), { offset: 90, length: 10 });
+  assert.deepEqual(byteRange('bytes=-500', 100), { offset: 0, length: 100 });
+  assert.equal(byteRange(null, 100), null);
+  assert.equal(byteRange('bytes=0-1,5-6', 100), null);
+  assert.equal(byteRange('items=0-1', 100), null);
+  assert.equal(byteRange('bytes=100-', 100), 'unsatisfiable');
+  assert.equal(byteRange('bytes=-0', 100), 'unsatisfiable');
+  assert.equal(byteRange('bytes=5-2', 100), 'unsatisfiable');
 });

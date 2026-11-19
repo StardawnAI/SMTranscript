@@ -4,7 +4,8 @@ A Cloudflare Worker that keeps each customer's transcripts and post texts as tex
 database of the customer's own: one SQLite Durable Object per customer, with FTS5 full-text
 search. The SMTranscript MCP server writes to it and reads from it when
 `SMTRANSCRIPT_LIBRARY_URL` and `SMTRANSCRIPT_LIBRARY_KEY` are set (see the main README).
-No pictures, picture links or videos are stored.
+No pictures, picture links or videos are kept in a library; the same worker hands out
+video downloads that are deleted one hour after they are ready (see [Downloads](#downloads)).
 
 Deployed at `https://smtranscript-library.jim-presting.workers.dev` (Cloudflare account
 `8d230a3cee37c5b1af5cc5cffad91030`). The operator's admin token and the issued keys are kept
@@ -93,6 +94,30 @@ Claude or ChatGPT, decision SA-D7) does the extracting; no model runs here. The 
 extract, keep the results, until `remaining` is 0. Results count toward the library's size
 and go with their text or their schema.
 
+## Downloads
+
+A person asks their chat (Claude Code, Codex, ChatGPT, Claude) to download a video; the
+SMTranscript worker fetches it, uploads it here and the chat hands out a link. The file is
+deleted one hour after its upload completed, automatically, and nothing can extend that hour.
+
+- The SMTranscript worker uploads with the upload token (`Authorization: Bearer <upload
+token>`, at least 32 characters; the worker holds only its SHA-256, secret
+  `UPLOAD_TOKEN_SHA256`, and refuses with 503 while it is not set). It announces the file,
+  sends it in parts of exactly `part_size` (64 MiB; the last part is the rest; R2 joins only
+  equal parts), then completes it and gets the link.
+- The link `GET /d/<id>/<file>` needs no key: the id is 128 random bits. It streams from R2
+  (bucket `awg-smtranscript`, key `downloads/<id>/<file>`) with byte ranges, as an attachment.
+- One `Downloads` Durable Object keeps the rows and sets its alarm for the next thing due:
+  it deletes every file whose hour is over and aborts every upload not completed within an
+  hour of being announced. The link answers 410 from the second the hour is over, even
+  before the alarm ran. A file R2 refused to delete is tried again a minute later; the
+  bucket's lifecycle rule on `downloads/` (1 day) is the backstop. Rows of gone files stay
+  30 days (a late click hears 410), then go.
+- Ceilings: 4 GiB a file (413 when announced), 100 GiB of announced and ready files at once
+  (507; the room comes back as files expire or uploads are aborted).
+- File names become ASCII letters, digits, `.`, `-` and `_`, keep their extension and are
+  at most 150 characters.
+
 ## API
 
 Customer routes take `Authorization: Bearer sml_...`:
@@ -119,6 +144,16 @@ Operator routes take `Authorization: Bearer <admin token>`:
 | `POST /v1/admin/customers` `{name}` | Creates a customer; the answer carries its key, once             |
 | `GET /v1/admin/customers`           | Lists customers: id, name, dates; never keys                     |
 | `DELETE /v1/admin/customers/<id>`   | Revokes the customer's key; `?erase=true` also deletes its texts |
+
+Download routes take `Authorization: Bearer <upload token>`, except the link:
+
+| Route                                                            | What it does                                                                                                                                                                                 |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/downloads` `{filename, mime, size, title, source_url}` | Announces a file of `size` bytes; answers `{id, part_size, parts, filename}` (the name as it is kept). 413 over 4 GiB, 507 when 100 GiB are stored                                           |
+| `PUT /v1/downloads/<id>/parts/<n>`                               | Part `n` (1 to `parts`) as raw bytes with `Content-Length`: exactly `part_size`, the last one the rest. Answers `{part, received, parts}`; 400 on a wrong size, 410 an hour after announcing |
+| `POST /v1/downloads/<id>/complete`                               | Joins the parts; answers `{url, expires_at, filename, size, title}`, `expires_at` (ISO 8601, UTC) one hour from now. Again: the same answer. 409 while parts are missing                     |
+| `POST /v1/downloads/<id>/abort`                                  | Drops an unfinished upload and its parts; `{aborted: true}`. 409 for a file already completed                                                                                                |
+| `GET /d/<id>/<file>`, `HEAD /d/<id>/<file>` (public)             | The file, with `Range` (206, 416 outside the file) and `Content-Disposition: attachment`. 404 unknown or not completed, 410 once its hour is over                                            |
 
 ## Limits
 
@@ -166,4 +201,5 @@ billed only beyond 12.5 million new reels a month, at USD 4 per further million.
 
 `node --test library/worker.test.mjs` runs the worker against `node:sqlite`, which stands in
 for the Durable Object's SQLite (`fake-cloudflare.mjs`), so schema, triggers and FTS5 run
-for real.
+for real. The same file holds an in-memory R2 bucket (multipart uploads included) and runs
+due alarms (`fireAlarms`), so a download's hour is tested with a mocked clock.

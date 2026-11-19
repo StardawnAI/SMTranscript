@@ -101,8 +101,10 @@ Any other MCP client: a stdio server, started with that command.
 
 ## Using it
 
-The server offers two tools: `get_youtube_transcript` for YouTube (below) and
-`get_social_transcript` for TikTok and Instagram ([its own section](#tiktok-and-instagram)).
+The server offers these tools: `get_youtube_transcript` for YouTube (below),
+`get_social_transcript` for TikTok, Instagram and Vimeo ([its own section](#tiktok-instagram-and-vimeo)),
+`get_instagram_images` for Instagram picture posts, and `download_video`
+([its own section](#downloading-a-video)) to get a video as a file.
 
 `get_youtube_transcript`:
 
@@ -182,7 +184,7 @@ more of the requested videos are left, the answer has `nextOffset`; the next cal
 as `offset` and carries on. Point such a server at a WARP proxy you run next to it with
 `YOUTUBE_TRANSCRIPT_PROXY=http://warp:1080` (the `caomingjun/warp` image serves HTTP on
 port 1080); it then uses that proxy for everything and never tries to start Docker itself.
-Such a server offers `get_social_transcript` and `get_instagram_images` only when it is given
+Such a server offers `get_social_transcript`, `get_instagram_images` and `download_video` only when it is given
 a worker to use (`SMTRANSCRIPT_WORKER_URL`, see below). Inline, `get_instagram_images` attaches
 the pictures themselves to the answer as MCP image content (up to 10), so a model can look at them.
 
@@ -374,6 +376,30 @@ files answer 404. Settings are environment variables (`SMT_WARP_PROXY`, `SMT_ROU
 `SMTRANSCRIPT_WORKER_URL` and `SMTRANSCRIPT_WORKER_KEY` starts nothing locally; a worker behind
 Cloudflare Access also gets `SMTRANSCRIPT_ACCESS_CLIENT_ID` and `SMTRANSCRIPT_ACCESS_CLIENT_SECRET`
 (a service token), sent as `CF-Access-Client-Id` / `CF-Access-Client-Secret`.
+
+## Downloading a video
+
+`download_video` takes a link to one video (YouTube watch, `youtu.be`, shorts or live; TikTok;
+Instagram; Vimeo) and answers with a download link:
+
+```json
+{
+  "url": "https://…/d/<id>/Me_at_the_zoo.mp4",
+  "expires_at": "2026-11-19T13:00:00Z",
+  "filename": "Me_at_the_zoo.mp4",
+  "size": 1048576,
+  "title": "Me at the zoo",
+  "note": "The link works for one hour; then the file is deleted on our side."
+}
+```
+
+The model hands the link to the user, who clicks it; the link is public and works for one hour
+from the moment the file is ready. After that the file is deleted on our side automatically, and
+nothing is kept in the text library (a video has no text). `route` (`"direct"` or `"warp"`) is the
+only option. A call that runs out of time answers `status: "running"`; call again with the same
+link and nothing is downloaded twice; a call while the link is live gets the same link. It is offered
+only with the deployed worker (`SMTRANSCRIPT_WORKER_URL`), also on this machine: a local Docker worker
+has no upload target that deletes the file after the hour.
 
 ## Cloudflare WARP
 

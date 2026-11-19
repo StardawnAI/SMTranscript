@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-PLATFORMS = ("tiktok", "instagram", "vimeo")
+PLATFORMS = ("tiktok", "instagram", "vimeo", "youtube")
 
 
 def _int(name: str, default: int) -> int:
@@ -60,6 +60,11 @@ class Settings:
     asr_backlog: int = 3
     # What an "openai:" model falls back to when OpenAI cannot answer.
     asr_fallback: str = "large-v3-turbo"
+    # Downloads (kind "download"): the library worker that holds a file for one
+    # hour behind a link, its upload token, and the largest file fetched for it.
+    download_url: str | None = None
+    download_token: str | None = None
+    download_max_mb: int = 2048
 
     @property
     def db_path(self) -> Path:
@@ -123,6 +128,9 @@ def load() -> Settings:
             raise SystemExit(f"route {route!r} for {platform} is not configured (set SMT_WARP_PROXY for warp)")
     cookies = os.environ.get("SMT_COOKIES_DIR")
     session = os.environ.get("SMT_INSTALOADER_SESSION")
+    download_url = (os.environ.get("SMT_DOWNLOAD_URL") or "").strip().rstrip("/") or None
+    if download_url and not download_url.startswith(("https://", "http://")):
+        raise SystemExit("SMT_DOWNLOAD_URL is the library worker's address, starting with https://")
     return Settings(
         data=Path(os.environ.get("SMT_DATA", "/data")),
         keys=keys,
@@ -138,6 +146,7 @@ def load() -> Settings:
             "tiktok": _float("SMT_GAP_TIKTOK", 2.0),
             "instagram": _float("SMT_GAP_INSTAGRAM", 5.0),
             "vimeo": _float("SMT_GAP_VIMEO", 2.0),
+            "youtube": _float("SMT_GAP_YOUTUBE", 2.0),
         },
         fetch_workers=_int("SMT_FETCH_WORKERS", 2),
         asr_workers=_int("SMT_ASR_WORKERS", 1),
@@ -154,4 +163,7 @@ def load() -> Settings:
         cookies_dir=Path(cookies) if cookies else None,
         instaloader_session=Path(session) if session else None,
         instagram_user=os.environ.get("SMT_INSTAGRAM_USER") or None,
+        download_url=download_url,
+        download_token=os.environ.get("SMT_DOWNLOAD_TOKEN") or None,
+        download_max_mb=_int("SMT_DOWNLOAD_MAX_MB", 2048),
     )

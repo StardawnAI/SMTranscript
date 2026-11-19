@@ -674,12 +674,297 @@ async function operator(request, env, token) {
   return env.LIBRARY.get(env.LIBRARY.idFromName(id)).fetch(request);
 }
 
+// Video downloads with a one-hour link. The SMTranscript worker uploads a file
+// in parts with the upload token (the worker knows only its SHA-256, secret
+// UPLOAD_TOKEN_SHA256); anyone with the link can fetch it until it expires one
+// hour after the upload completed. Then the Downloads object deletes it from R2,
+// and nothing can extend that hour.
+export const PART_SIZE = 64 * 1024 * 1024;
+export const MAX_DOWNLOAD_BYTES = 4 * 1024 ** 3;
+export const MAX_STORED_BYTES = 100 * 1024 ** 3;
+export const LINK_MS = 3600 * 1000;
+export const UPLOAD_MS = 3600 * 1000;
+// A delete R2 refused is tried again after a minute; rows of gone files are
+// kept 30 days, so a late click hears "expired" (410) rather than "unknown".
+const RETRY_MS = 60 * 1000;
+const KEEP_GONE_MS = 30 * 24 * 3600 * 1000;
+const HEX = '0123456789abcdef';
+
+// A file name safe in a URL path and a Content-Disposition header: ASCII
+// letters, digits, dot, dash and underscore, the extension kept, up to 150 characters.
+export function downloadName(raw) {
+  const name = String(raw ?? '').normalize('NFKD').replace(/[̀-ͯ]/g, '').split(/[/\\]/).pop();
+  const dot = name.lastIndexOf('.');
+  const ext = dot > 0 && /^[A-Za-z0-9]{1,10}$/.test(name.slice(dot + 1)) ? name.slice(dot + 1) : '';
+  const stem = (ext ? name.slice(0, dot) : name).replace(/[^A-Za-z0-9._-]+/g, '_').replace(/_+/g, '_')
+    .replace(/^[._-]+|[._-]+$/g, '');
+  const room = 150 - (ext ? ext.length + 1 : 0);
+  const base = stem.slice(0, room).replace(/[._-]+$/, '') || 'download';
+  return ext ? `${base}.${ext}` : base;
+}
+
+// One byte range of a `Range: bytes=...` header as R2 takes it, null to send
+// the whole file (no header, or one this worker does not read), or
+// 'unsatisfiable' for a range outside the file.
+export function byteRange(header, size) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim());
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  if (m[1] === '') {
+    const length = Math.min(Number(m[2]), size);
+    return length > 0 ? { offset: size - length, length } : 'unsatisfiable';
+  }
+  const start = Number(m[1]);
+  const end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+  if (start >= size || end < start) return 'unsatisfiable';
+  return { offset: start, length: end - start + 1 };
+}
+
+const disposition = (filename) => `attachment; filename="${filename}"`;
+const partsOf = (size) => Math.ceil(size / PART_SIZE);
+
+const DOWNLOAD_SCHEMA = [
+  'create table if not exists download (id text primary key, key text not null, upload_id text, filename text not null,'
+    + ' mime text not null, size integer not null, title text, source_url text, created_at integer not null,'
+    + ' completed_at integer, expires_at integer, state text not null)',
+  'create table if not exists download_part (id text not null, n integer not null, etag text not null, primary key (id, n))',
+  'create index if not exists download_state on download (state)',
+];
+
+// The rows of every download, and the alarm that deletes each one when its
+// hour is over. One object for all (idFromName('downloads')), so the
+// storage ceiling is checked and reserved in one place.
+export class Downloads {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+    for (const statement of DOWNLOAD_SCHEMA) ctx.storage.sql.exec(statement);
+  }
+
+  rows(query, ...bindings) {
+    return this.ctx.storage.sql.exec(query, ...bindings.map((b) => (b === undefined ? null : b))).toArray();
+  }
+
+  row(id) {
+    return this.rows('select * from download where id = ?', id)[0] || null;
+  }
+
+  async fetch(request) {
+    try {
+      const { pathname } = new URL(request.url);
+      const body = await readJson(request);
+      if (pathname === '/internal/create') return await this.create(body);
+      if (pathname === '/internal/get') {
+        const row = this.row(body.id);
+        return row ? json(200, row) : fail(404, 'no such download');
+      }
+      if (pathname === '/internal/part') return this.part(body);
+      if (pathname === '/internal/complete') return await this.complete(body);
+      if (pathname === '/internal/abort') return await this.abort(body);
+      return fail(404, 'no such route');
+    } catch (e) {
+      if (e instanceof Refused) return fail(e.status, e.message);
+      return fail(500, 'the downloads could not answer');
+    }
+  }
+
+  async create(body) {
+    const size = Number(body.size);
+    if (!Number.isSafeInteger(size) || size < 1) return fail(400, 'size must be the file\'s size in bytes');
+    if (size > MAX_DOWNLOAD_BYTES) return fail(413, `a file is at most ${MAX_DOWNLOAD_BYTES} bytes`);
+    const filename = downloadName(body.filename);
+    const mime = /^[\w.+-]+\/[\w.+-]+$/.test(body.mime || '') ? body.mime : 'application/octet-stream';
+    const id = randomId(32, HEX);
+    const key = `downloads/${id}/${filename}`;
+    // Checked and reserved with no await between: no other request can slip in.
+    const [{ stored }] = this.rows("select coalesce(sum(size), 0) as stored from download where state in ('uploading', 'live')");
+    if (stored + size > MAX_STORED_BYTES) return fail(507, 'the download storage is full; files leave it within the hour');
+    this.rows('insert into download (id, key, filename, mime, size, title, source_url, created_at, state)'
+      + " values (?, ?, ?, ?, ?, ?, ?, ?, 'uploading')", id, key, filename, mime, size, short(body.title, 500),
+    short(body.source_url, 2048), Date.now());
+    let upload;
+    try {
+      upload = await this.env.DOWNLOADS.createMultipartUpload(key, { httpMetadata: { contentType: mime, contentDisposition: disposition(filename) } });
+    } catch (e) {
+      this.rows("update download set state = 'aborted' where id = ?", id);
+      throw e;
+    }
+    this.rows('update download set upload_id = ? where id = ?', upload.uploadId, id);
+    await this.arm();
+    return json(200, { id, part_size: PART_SIZE, parts: partsOf(size), filename });
+  }
+
+  part(body) {
+    const row = this.row(body.id);
+    if (!row) return fail(404, 'no such download');
+    if (row.state !== 'uploading') return fail(409, `this download is ${row.state}`);
+    this.rows('insert or replace into download_part (id, n, etag) values (?, ?, ?)', row.id, body.n, String(body.etag));
+    const [{ received }] = this.rows('select count(*) as received from download_part where id = ?', row.id);
+    return json(200, { part: body.n, received, parts: partsOf(row.size) });
+  }
+
+  answer(row, origin) {
+    return json(200, {
+      url: `${origin}/d/${row.id}/${encodeURIComponent(row.filename)}`, expires_at: new Date(row.expires_at).toISOString(),
+      filename: row.filename, size: row.size, title: row.title,
+    });
+  }
+
+  async complete(body) {
+    const row = this.row(body.id);
+    if (!row) return fail(404, 'no such download');
+    // A retried complete gets the same link again.
+    if (row.state === 'live' && row.expires_at > Date.now()) return this.answer(row, body.origin);
+    if (row.state !== 'uploading') return fail(409, `this download is ${row.state === 'live' ? 'expired' : row.state}`);
+    if (row.created_at + UPLOAD_MS <= Date.now()) return fail(410, 'the upload took over an hour and was dropped');
+    const parts = this.rows('select n as partNumber, etag from download_part where id = ? order by n', row.id);
+    const missing = [];
+    for (let n = 1; n <= partsOf(row.size); n += 1) if (!parts.some((p) => p.partNumber === n)) missing.push(n);
+    if (missing.length) return fail(409, `parts missing: ${missing.slice(0, 20).join(', ')}`);
+    const object = await this.env.DOWNLOADS.resumeMultipartUpload(row.key, row.upload_id).complete(parts);
+    if (object.size !== row.size) {
+      await this.env.DOWNLOADS.delete(row.key);
+      this.rows("update download set state = 'aborted' where id = ?", row.id);
+      return fail(409, `the parts make ${object.size} bytes, not the ${row.size} announced; the upload was dropped`);
+    }
+    const done = Date.now();
+    this.rows("update download set state = 'live', completed_at = ?, expires_at = ? where id = ?", done, done + LINK_MS, row.id);
+    this.rows('delete from download_part where id = ?', row.id);
+    await this.arm();
+    return this.answer(this.row(row.id), body.origin);
+  }
+
+  async abort(body) {
+    const row = this.row(body.id);
+    if (!row) return fail(404, 'no such download');
+    if (row.state === 'aborted') return json(200, { aborted: true });
+    if (row.state !== 'uploading') return fail(409, `this download is ${row.state}; only an upload can be aborted`);
+    await this.drop(row);
+    await this.arm();
+    return json(200, { aborted: true });
+  }
+
+  // An unfinished upload goes: its row first, so no part or complete lands after.
+  async drop(row) {
+    this.rows("update download set state = 'aborted' where id = ?", row.id);
+    this.rows('delete from download_part where id = ?', row.id);
+    if (!row.upload_id) return;
+    try {
+      await this.env.DOWNLOADS.resumeMultipartUpload(row.key, row.upload_id).abort();
+    } catch {
+      // Gone already, or R2 refused: the bucket's lifecycle rule ends it within a day.
+    }
+  }
+
+  async alarm() {
+    const time = Date.now();
+    for (const row of this.rows("select id, key from download where state = 'live' and expires_at <= ?", time)) {
+      try {
+        await this.env.DOWNLOADS.delete(row.key);
+        this.rows("update download set state = 'deleted' where id = ?", row.id);
+      } catch {
+        // Stays due; arm() tries again in a minute.
+      }
+    }
+    for (const row of this.rows("select * from download where state = 'uploading' and created_at <= ?", time - UPLOAD_MS)) {
+      await this.drop(row);
+    }
+    this.rows("delete from download where state in ('deleted', 'aborted') and created_at <= ?", time - KEEP_GONE_MS);
+    await this.arm();
+  }
+
+  // The alarm is set for the next file to delete or upload to drop.
+  async arm() {
+    const [{ next }] = this.rows("select min(due) as next from (select expires_at as due from download where state = 'live'"
+      + " union all select created_at + ? as due from download where state = 'uploading')", UPLOAD_MS);
+    if (next === null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(next <= Date.now() ? Date.now() + RETRY_MS : next);
+  }
+}
+
+async function downloads(request, env, url) {
+  const expected = String(env.UPLOAD_TOKEN_SHA256 || '').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(expected)) return fail(503, 'UPLOAD_TOKEN_SHA256 is not set on this worker');
+  const given = bearer(request);
+  if (given.length < 32 || !sameText(await sha256(given), expected)) return fail(401, 'upload token required');
+  const index = env.DOWNLOAD_INDEX.get(env.DOWNLOAD_INDEX.idFromName('downloads'));
+  if (url.pathname === '/v1/downloads' && request.method === 'POST') return internal(index, '/internal/create', await readJson(request));
+  const m = /^\/v1\/downloads\/([a-f0-9]{32})\/(?:parts\/(\d{1,5})|(complete|abort))$/.exec(url.pathname);
+  if (m && m[2] && request.method === 'PUT') return uploadPart(request, env, index, m[1], Number(m[2]));
+  if (m && m[3] && request.method === 'POST') return internal(index, `/internal/${m[3]}`, { id: m[1], origin: url.origin });
+  return fail(404, 'no such route');
+}
+
+// The bytes go from the request straight to R2; the Downloads object only
+// keeps which parts arrived.
+async function uploadPart(request, env, index, id, n) {
+  const found = await internal(index, '/internal/get', { id });
+  if (!found.ok) return found;
+  const row = await found.json();
+  if (row.state !== 'uploading') return fail(409, `this download is ${row.state}`);
+  if (row.created_at + UPLOAD_MS <= Date.now()) return fail(410, 'the upload took over an hour and was dropped');
+  const parts = partsOf(row.size);
+  if (n < 1 || n > parts) return fail(400, `part must be 1 to ${parts}`);
+  // R2 joins only equal parts: every part but the last is exactly PART_SIZE.
+  const expected = n < parts ? PART_SIZE : row.size - (parts - 1) * PART_SIZE;
+  const length = request.headers.get('content-length');
+  if (length === null) return fail(411, 'content-length is required');
+  if (Number(length) !== expected) return fail(400, `part ${n} must be exactly ${expected} bytes`);
+  const uploaded = await env.DOWNLOADS.resumeMultipartUpload(row.key, row.upload_id).uploadPart(n, request.body);
+  return internal(index, '/internal/part', { id, n, etag: uploaded.etag });
+}
+
+// The public link: no key, the 128-bit id is the secret. Streams from R2 and
+// answers byte ranges; 410 once the hour is over.
+async function serve(request, env, id, name) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') return fail(405, 'GET or HEAD only');
+  const found = await internal(env.DOWNLOAD_INDEX.get(env.DOWNLOAD_INDEX.idFromName('downloads')), '/internal/get', { id });
+  if (found.status === 404) return fail(404, 'no such download');
+  if (!found.ok) return found;
+  const row = await found.json();
+  if (row.filename !== name) return fail(404, 'no such download');
+  const gone = fail(410, 'this download expired: a link lasts one hour');
+  if (row.state === 'deleted' || (row.state === 'live' && row.expires_at <= Date.now())) return gone;
+  if (row.state !== 'live') return fail(404, 'no such download');
+  const headers = {
+    'content-type': row.mime, 'content-disposition': disposition(row.filename), 'accept-ranges': 'bytes', 'cache-control': 'no-store',
+  };
+  if (request.method === 'HEAD') {
+    if (!(await env.DOWNLOADS.head(row.key))) return gone;
+    return new Response(null, { status: 200, headers: { ...headers, 'content-length': String(row.size) } });
+  }
+  const range = byteRange(request.headers.get('range'), row.size);
+  if (range === 'unsatisfiable') {
+    return new Response(null, { status: 416, headers: { ...headers, 'content-range': `bytes */${row.size}` } });
+  }
+  const object = await env.DOWNLOADS.get(row.key, range ? { range } : {});
+  if (!object) return gone;
+  if (!range) return new Response(object.body, { status: 200, headers: { ...headers, 'content-length': String(row.size) } });
+  return new Response(object.body, {
+    status: 206,
+    headers: {
+      ...headers, 'content-length': String(range.length),
+      'content-range': `bytes ${range.offset}-${range.offset + range.length - 1}/${row.size}`,
+    },
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/healthz') return json(200, { ok: true });
       if (url.pathname.startsWith('/v1/admin/')) return await admin(request, env, url);
+      if (url.pathname === '/v1/downloads' || url.pathname.startsWith('/v1/downloads/')) return await downloads(request, env, url);
+      const link = /^\/d\/([a-f0-9]{32})\/([^/]+)$/.exec(url.pathname);
+      if (link) {
+        let name;
+        try {
+          name = decodeURIComponent(link[2]);
+        } catch {
+          return fail(404, 'no such download');
+        }
+        return await serve(request, env, link[1], name);
+      }
       if (url.pathname.startsWith('/v1/')) {
         const token = bearer(request);
         const m = KEY.exec(token);

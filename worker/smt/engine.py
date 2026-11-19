@@ -6,6 +6,10 @@ A job moves through stages, each run by its own kind of thread:
   asr      transcribe the stored file (no platform requests, ever)
   profile  list an account's videos and queue one video job each
 
+A download job (kind "download") runs in the fetch stage only: the whole video
+as one mp4, handed to the library worker behind a link that lasts one hour,
+and deleted here whatever happens. Nothing of it is transcribed or kept.
+
 Threads claim work with a lease they renew while they hold it. A worker that
 dies leaves a lease that runs out, and the next claim picks the job up again —
 at the stage it was in, so a finished download is not repeated because the
@@ -32,10 +36,11 @@ import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from . import understand as understand_engine
-from . import VERSION, fetch, guard, ocr as ocr_engine
+from . import VERSION, fetch, guard, ocr as ocr_engine, upload
 from .asr import Asr, OpenAiAsr, extract_audio, has_audio
 from .config import Settings
 from .db import TERMINAL, Db
@@ -100,6 +105,27 @@ LINK_FRESH_S = 12 * 3600
 # Only what the post itself is: a parser error or a setting here can be fixed
 # on our side, and then asking again must work at once.
 SETTLED = {"unavailable", "private", "login_required", "drm", "too_large"}
+DOWNLOAD_PLATFORMS = ("youtube", "tiktok", "instagram", "vimeo")
+DOWNLOADS_OFF = "downloads are not configured on this worker (SMT_DOWNLOAD_URL and SMT_DOWNLOAD_TOKEN are unset)"
+# A download link this close to its end is not handed out again: the video is fetched anew.
+LINK_MARGIN_S = 5 * 60
+
+
+def _download_name(title: str | None, fallback: str, suffix: str) -> str:
+    """A plain file name from the title: letters, digits, dot, dash, underscore."""
+    plain = unicodedata.normalize("NFKD", title or "").encode("ascii", "ignore").decode()
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", plain).strip("-._")[:80].rstrip("-._")
+    return (name or re.sub(r"[^A-Za-z0-9_-]+", "-", fallback) or "video") + (suffix or ".mp4")
+
+
+def _link_alive(job: dict) -> bool:
+    """Whether a finished download's link still has more than LINK_MARGIN_S to go."""
+    found = json.loads(job.get("result") or "{}").get("download") or {}
+    try:
+        ends = dt.datetime.fromisoformat(str(found.get("expires_at")).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+    return ends > _now() + LINK_MARGIN_S
 
 
 def _member(options: dict | None) -> str | None:
@@ -162,6 +188,7 @@ class Engine:
         self.name = f"worker-{os.getpid()}-{secrets.token_hex(3)}"
         # Adapters are attributes so a test can stand in for the network.
         self.fetch = fetch
+        self.upload = upload
         self.ocr = ocr or ocr_engine.read_text
         self.understand = understand_engine
         self.model_keys = understand_engine.available()
@@ -225,12 +252,15 @@ class Engine:
         stale_link = bool(existing and existing["status"] == "completed" and options.get("video_link")
                           and existing["platform"] == "instagram" and existing["platform_id"]
                           and not self._fresh_link(self._parts(existing["platform"], existing["platform_id"])))
+        # A download whose link has run out (or nearly): the video is fetched anew.
+        stale_link = stale_link or bool(existing and kind == "download" and existing["status"] == "completed"
+                                        and not _link_alive(existing))
         if existing and (existing["status"] in ("failed", "partial", "cancelled") or stale_link):
             # Asking again after a failure means: try again. What is stored
             # already is kept, so the second try only does what is missing.
             self.db.run(
                 "update job set status = 'queued', stage = ?, attempts = 0, next_at = 0, error_class = null,"
-                " error = null, warnings = '[]', finished_at = null, updated_at = ? where id = ?",
+                " error = null, warnings = '[]', finished_at = null, result = null, updated_at = ? where id = ?",
                 ("profile" if kind == "profile" else "fetch", _now(), existing["id"]))
             self.db.run("delete from profile_cursor where job_id = ?", (existing["id"],))
             self.db.audit("retry", tenant, existing["id"])
@@ -262,8 +292,26 @@ class Engine:
         target = guard.parse(url)
         if target.kind == "profile":
             raise JobError("invalid_input", "this is an account, not a video — use a profile import")
+        if target.platform == "youtube":
+            raise JobError("invalid_input", 'YouTube links are taken for downloads only here (kind "download")')
         return self._insert(tenant, "video", target, url, self._options(options or {}), idem, parent,
                             _priority(options), _member(options))
+
+    def submit_download(self, tenant: str, url: str, options: dict | None = None,
+                        idem: str | None = None) -> tuple[dict, bool]:
+        """The whole video as one mp4 behind a link that lasts one hour."""
+        if not (self.s.download_url and self.s.download_token):
+            raise JobError("invalid_input", DOWNLOADS_OFF)
+        target = guard.parse(url)
+        if target.platform not in DOWNLOAD_PLATFORMS or target.kind == "profile":
+            raise JobError("invalid_input", "downloads take one video link (YouTube, TikTok, Instagram or Vimeo), "
+                                            "not an account")
+        options = options or {}
+        route = options.get("route")
+        if route is not None and route not in self.s.routes:
+            raise JobError("invalid_input", f"route {route!r} is not configured here (have: {', '.join(self.s.routes)})")
+        return self._insert(tenant, "download", target, url, {"route": route}, idem, priority=_priority(options),
+                            member=_member(options))
 
     def submit_images(self, tenant: str, url: str, options: dict | None = None, idem: str | None = None,
                       parent: str | None = None) -> tuple[dict, bool]:
@@ -497,6 +545,8 @@ class Engine:
                     raise err from exc
             self._set(job["id"], platform_id=target.platform_id, canonical_url=target.canonical_url)
 
+        if job["kind"] == "download":
+            return self._fetch_download(job, target, proxy, count)
         parts = self._parts(target.platform, target.platform_id)
         # A transcript that exists answers the job: no download, even when the
         # file it was made from is long deleted.
@@ -577,6 +627,49 @@ class Engine:
             return self._parts(platform, target.platform_id)
         finally:
             shutil.rmtree(tmp_root, ignore_errors=True)
+
+    def _fetch_download(self, job: dict, target: guard.Target, proxy, count):
+        """The whole video as one mp4, uploaded in parts to the library worker,
+        which deletes it one hour later. The local file goes in every case."""
+        if not (self.s.download_url and self.s.download_token):
+            raise JobError("invalid_input", DOWNLOADS_OFF)
+        free_mb = shutil.disk_usage(self.s.data).free // (1024 * 1024)
+        if free_mb < self.s.min_free_mb:
+            raise JobError("disk_full", f"only {free_mb} MB free, {self.s.min_free_mb} MB kept in reserve")
+        max_mb = self.s.download_max_mb
+        tmp_root = self.s.tmp_dir / job["id"]
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        (tmp_root / "session").mkdir(parents=True)
+        try:
+            cookiefile = self.fetch.cookie_copy(self.s.cookies_dir, target.platform, tmp_root / "session")
+            with self.fetch.file_session(proxy, cookiefile, max_mb, count) as ses:
+                infos = self._resolve(job, target, ses)
+                info = infos[0]
+                if len(infos) > 1:
+                    self._warn(job["id"], f"the post has {len(infos)} videos; the first one was downloaded")
+                if info.get("is_live"):
+                    raise JobError("invalid_input", "a live stream that is still running cannot be downloaded; "
+                                                    "ask again when it has ended")
+                self._set(job["id"], status="fetching")
+                (tmp_root / "file").mkdir()
+                path = self._download_one(target.platform, job["route"], info, tmp_root / "file", ses)["video"]
+            size = path.stat().st_size
+            if size > max_mb * 1024 * 1024:
+                raise JobError("too_large", f"{size // 2**20} MB is over the {max_mb} MB download limit")
+            if size == 0:
+                raise JobError("parser", "the downloaded file is empty")
+            title = info.get("title") or info.get("fulltitle")
+            filename = _download_name(title, target.platform_id, path.suffix)
+            link = self.upload.upload(path, self.s.download_url, self.s.download_token, filename=filename,
+                                      mime=mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                                      title=title, source_url=target.canonical_url)
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+        download = {"url": link["url"], "expires_at": link["expires_at"], "filename": link.get("filename", filename),
+                    "size": size, "title": title}
+        self._set(job["id"], result=json.dumps({"download": download}))
+        self.db.audit("download", job["tenant"], job["id"], size=size, expires_at=link["expires_at"])
+        self._finish(job["id"])
 
     def _fresh_link(self, parts: list[dict]) -> bool:
         """Whether the post's mp4 link was read in the last 12 hours."""
@@ -1060,6 +1153,14 @@ class Engine:
                 jobs = {r["id"]: r for r in self.db.all(f"select id, status from job where id in ({marks})", ids)}
             base["account"] = job["canonical_url"]
             base["videos"] = [{**i, "status": jobs.get(i["job_id"], {}).get("status")} for i in items]
+            return base
+        if job["kind"] == "download":
+            # {download: {url, expires_at, filename, size, title}} once done.
+            base["source_url"] = job["canonical_url"]
+            base["provenance"] = {"adapter": "yt_dlp", "adapter_version": fetch.adapter_version(),
+                                  "worker_version": VERSION, "route": job["route"],
+                                  "retrieved_at": _iso(job["finished_at"] or job["updated_at"])}
+            base.update(json.loads(job["result"] or "{}"))
             return base
         parts = self._parts(job["platform"], job["platform_id"]) if job["platform_id"] else []
         outs = [self._part_out(p, opts, job["kind"]) for p in parts]

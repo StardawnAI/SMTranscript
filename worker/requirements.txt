@@ -3,6 +3,8 @@
 #   docker run --rm --entrypoint pip smtranscript-worker freeze > worker/requirements.lock
 # after changing a version here.
 yt-dlp==2026.10.26
+# The scripts yt-dlp runs in deno to solve YouTube's JavaScript challenges (the version yt-dlp pins).
+yt-dlp-ejs==0.8.0
 curl_cffi==0.17.0
 faster-whisper==1.2.1
 instaloader==4.16

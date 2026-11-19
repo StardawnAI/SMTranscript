@@ -1,10 +1,10 @@
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
-import { IMAGE_BLOCKS, client, fetchImages, fileName, parseSocialLink, runImagesTool, runSocialTool, shape } from '../src/social.mjs';
+import { IMAGE_BLOCKS, client, fetchImages, fileName, parseDownloadLink, parseSocialLink, runDownloadTool, runImagesTool, runSocialTool, shape } from '../src/social.mjs';
 import { tools } from '../src/mcp-server.mjs';
 
 const TT = 'https://www.tiktok.com/@tagesschau/video/7702581353048624387';
@@ -160,9 +160,10 @@ test('a server elsewhere offers the social tool only with a worker to use', () =
     process.env.YOUTUBE_TRANSCRIPT_OUTPUT = 'inline';
     assert.deepEqual(tools({}).map((t) => t.tool.name), ['get_youtube_transcript']);
     assert.deepEqual(tools({ SMTRANSCRIPT_WORKER_URL: 'http://w' }).map((t) => t.tool.name),
-      ['get_youtube_transcript', 'get_social_transcript', 'get_instagram_images']);
+      ['get_youtube_transcript', 'get_social_transcript', 'get_instagram_images', 'download_video']);
     delete process.env.YOUTUBE_TRANSCRIPT_OUTPUT;
-    assert.equal(tools({}).length, 3);
+    assert.deepEqual(tools({}).map((t) => t.tool.name),
+      ['get_youtube_transcript', 'get_social_transcript', 'get_instagram_images']);
   } finally {
     if (saved === undefined) delete process.env.YOUTUBE_TRANSCRIPT_OUTPUT;
     else process.env.YOUTUBE_TRANSCRIPT_OUTPUT = saved;
@@ -273,4 +274,126 @@ test('Vimeo: single videos, not accounts', async () => {
   const out = await runSocialTool({ url: 'https://player.vimeo.com/video/76979871', language: 'de' }, {}, deps(api));
   assert.equal((out.platform, out.fullText), 'Hier bei Vimeo');
   await assert.rejects(runSocialTool({ url: 'https://vimeo.com/76979871', url_type: 'profile' }, {}, deps(api)), /single videos only/);
+});
+
+// ---------------------------------------------------------------------------
+// download_video
+// ---------------------------------------------------------------------------
+
+const YT = 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
+const download = { url: 'https://lib.example/d/abc123/Me_at_the_zoo.mp4', expires_at: '2026-11-19T13:00:00Z', filename: 'Me_at_the_zoo.mp4', size: 1048576, title: 'Me at the zoo' };
+
+test('download_video: links are one video of the four platforms, never a playlist or an account', () => {
+  const cases = {
+    [YT]: 'youtube/video',
+    'https://youtu.be/jNQXAC9IVRw': 'youtube/video',
+    'https://www.youtube.com/shorts/jNQXAC9IVRw': 'youtube/video',
+    'https://www.youtube.com/live/jNQXAC9IVRw': 'youtube/video',
+    'https://m.youtube.com/watch?v=jNQXAC9IVRw': 'youtube/video',
+    'https://www.youtube.com/playlist?list=PLabc': null,
+    'https://www.youtube.com/@somechannel': null,
+    'https://youtube.com.evil.io/watch?v=jNQXAC9IVRw': null,
+    'https://example.com/watch?v=jNQXAC9IVRw': null,
+    'jNQXAC9IVRw': null,
+    [TT]: 'tiktok/video',
+    'https://www.instagram.com/reel/DNoIGNAu8fy/': 'instagram/video',
+    'https://vimeo.com/76979871': 'vimeo/video',
+    'https://www.tiktok.com/@tagesschau': null,
+    'https://www.instagram.com/tagesschau/': null,
+  };
+  for (const [url, want] of Object.entries(cases)) {
+    const got = parseDownloadLink(url);
+    assert.equal(got ? `${got.platform}/${got.kind}` : null, want, url);
+  }
+});
+
+test('download_video submits a download job and maps the worker result to the link', async () => {
+  const api = fakeApi({ results: { job_v: { ...result('job_v', ''), kind: 'download', transcript: undefined, download } } });
+  const out = await runDownloadTool({ url: YT }, {}, deps(api));
+  assert.equal(api.calls.length, 1);
+  const [name, body] = api.calls[0];
+  assert.equal(name, 'submit');
+  assert.equal(body.kind, 'download');
+  assert.equal(body.url, YT);
+  assert.equal(body.route, 'direct');
+  assert.equal(body.idempotency_key, `download:${YT}`);
+  assert.deepEqual(out, { ...download, note: 'The link works for one hour; then the file is deleted on our side.' });
+});
+
+test('download_video asked again after the hour turns finds the same job, not a second download', async () => {
+  const api = fakeApi({ pending: 0, results: { job_v: { ...result('job_v', ''), kind: 'download', transcript: undefined, download } } });
+  mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-19T10:50:00Z') });
+  try {
+    await runDownloadTool({ url: YT }, {}, deps(api));
+    mock.timers.setTime(Date.parse('2026-11-19T11:01:00Z'));
+    await runDownloadTool({ url: YT }, {}, deps(api));
+  } finally {
+    mock.timers.reset();
+  }
+  const keys = api.calls.filter(([name]) => name === 'submit').map(([, body]) => body.idempotency_key);
+  assert.deepEqual(keys, [`download:${YT}`, `download:${YT}`]);
+});
+
+test('download_video takes the route and the title falls back to the media title', async () => {
+  let started = 0;
+  const { title, ...noTitle } = download;
+  const api = fakeApi({ results: { job_v: { ...result('job_v', ''), download: noTitle } } });
+  const out = await runDownloadTool({ url: TT, route: 'warp' }, {}, deps(api, { ensureWarp: async () => { started++; } }));
+  assert.equal(started, 1);
+  assert.equal(api.calls[0][1].route, 'warp');
+  assert.equal(out.title, 'T');
+  await assert.rejects(runDownloadTool({ url: TT, route: 'tor' }, {}, deps(fakeApi())), /route is/);
+});
+
+test('download_video that outlasts the wait answers running and can be asked again', async () => {
+  const api = fakeApi({ pending: 1000 });
+  const out = await runDownloadTool({ url: YT }, {}, deps(api, { seconds: 0.05 }));
+  assert.equal(out.status, 'running');
+  assert.equal(out.jobId, 'job_v');
+  assert.equal(out.url, undefined);
+});
+
+test('download_video passes the worker error on in words', async () => {
+  const api = fakeApi({ results: { job_v: { ...result('job_v', ''), status: 'failed', error: { class: 'too_large', message: 'The video is larger than the 2048 MB limit' } } } });
+  await assert.rejects(runDownloadTool({ url: YT }, {}, deps(api)), /too_large — The video is larger than the 2048 MB limit/);
+  const bare = fakeApi({ results: { job_v: { ...result('job_v', ''), status: 'completed' } } });
+  await assert.rejects(runDownloadTool({ url: YT }, {}, deps(bare)), /without a download link/);
+});
+
+test('download_video refuses what is not one video, before any job', async () => {
+  const api = fakeApi();
+  await assert.rejects(runDownloadTool({ url: 'https://www.youtube.com/playlist?list=PLabc' }, {}, deps(api)), /not a YouTube, TikTok, Instagram or Vimeo video link/);
+  await assert.rejects(runDownloadTool({ url: '' }, {}, deps(api)), /url is required/);
+  assert.equal(api.calls.length, 0);
+});
+
+test('download_video is offered with a worker only, and a library keeps nothing for it', async () => {
+  const saved = process.env.YOUTUBE_TRANSCRIPT_OUTPUT;
+  try {
+    // Files mode on this machine: the local Docker worker has no upload target, so no tool.
+    delete process.env.YOUTUBE_TRANSCRIPT_OUTPUT;
+    assert.ok(!tools({}).some((t) => t.tool.name === 'download_video'));
+    assert.ok(tools({ SMTRANSCRIPT_WORKER_URL: 'http://w' }).some((t) => t.tool.name === 'download_video'));
+    process.env.YOUTUBE_TRANSCRIPT_OUTPUT = 'inline';
+    assert.ok(!tools({}).some((t) => t.tool.name === 'download_video'));
+    assert.ok(tools({ SMTRANSCRIPT_WORKER_URL: 'http://w' }).some((t) => t.tool.name === 'download_video'));
+    const saves = [];
+    const library = { save: async (r) => { saves.push(r); return { saved: [], rejected: [] }; }, get: async () => { throw new Error('not kept'); } };
+    const env = { SMTRANSCRIPT_WORKER_URL: 'http://w', SMTRANSCRIPT_LIBRARY_URL: 'http://l', SMTRANSCRIPT_LIBRARY_KEY: 'k' };
+    const entry = tools(env, library).find((t) => t.tool.name === 'download_video');
+    assert.equal(entry.tool.inputSchema.properties.folder, undefined);
+    assert.equal(entry.run, runDownloadTool);
+    assert.ok(tools(env, library).find((t) => t.tool.name === 'get_social_transcript').tool.inputSchema.properties.folder);
+    assert.equal(saves.length, 0);
+  } finally {
+    if (saved === undefined) delete process.env.YOUTUBE_TRANSCRIPT_OUTPUT;
+    else process.env.YOUTUBE_TRANSCRIPT_OUTPUT = saved;
+  }
+});
+
+test('download_video tells the model to hand over a one-hour link', () => {
+  const t = tools({ SMTRANSCRIPT_WORKER_URL: 'http://w' }).find((x) => x.tool.name === 'download_video').tool;
+  assert.match(t.description, /ONE HOUR/);
+  assert.match(t.description, /not kept/);
+  assert.match(t.description, /click/);
 });

@@ -17,7 +17,7 @@ SCHEMA = """
 create table if not exists job (
     id              text primary key,
     tenant          text not null,
-    kind            text not null,              -- video | profile
+    kind            text not null,              -- video | images | profile | download
     idem_key        text not null,
     input_url       text not null,
     platform        text not null,
@@ -133,6 +133,9 @@ class Db:
         # Databases from before 1.6.0 lack the member column.
         if "member" not in columns:
             self.conn.execute("alter table job add column member text")
+        # Databases from before 1.9.0 lack the result column (a download's link).
+        if "result" not in columns:
+            self.conn.execute("alter table job add column result text")
 
     @property
     def conn(self) -> sqlite3.Connection:

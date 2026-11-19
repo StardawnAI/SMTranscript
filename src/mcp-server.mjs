@@ -6,7 +6,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { BlockedError, getTranscript, getTranscripts, parsePlaylistId, parseVideoId, playlistVideoIds, searchVideoIds } from './youtube.mjs';
 import { configuredProxy, readConfig } from './config.mjs';
 import { dockerAvailable, rotate as rotateWarp, start as startWarp } from './warp.mjs';
-import { IMAGE_BLOCKS, imagesTool, runImagesTool, runSocialTool, socialTool } from './social.mjs';
+import { IMAGE_BLOCKS, downloadTool, imagesTool, runDownloadTool, runImagesTool, runSocialTool, socialTool } from './social.mjs';
 import { callerOf } from './caller.mjs';
 import { FOLDER_ARG, keeping, libraryFromEnv, libraryTools, noLibrary, youtubeRecord } from './library.mjs';
 
@@ -269,6 +269,8 @@ export async function runTool(args, { notify = () => {} } = {}, deps = {}) {
 // The TikTok/Instagram/Vimeo tools need a worker: Docker on this machine, or one
 // named in SMTRANSCRIPT_WORKER_URL. A server elsewhere (inline mode) without one
 // would only offer tools that always fail, so it does not offer them.
+// download_video needs the deployed worker (SMTRANSCRIPT_WORKER_URL): only it has the
+// upload target that deletes the file after an hour; a local Docker worker has none.
 // With a library (SMTRANSCRIPT_LIBRARY_URL and _KEY), every tool keeps what it
 // fetched there, and the library's own tools come along.
 // A library kept per caller (the AWG hub) is that caller's; a call that names
@@ -279,13 +281,17 @@ export function tools(env = process.env, library = libraryFromEnv(env), caller =
     list.push({ tool: socialTool(outputMode()), run: runSocialTool });
     list.push({ tool: imagesTool(outputMode()), run: runImagesTool });
   }
+  if (env.SMTRANSCRIPT_WORKER_URL) list.push({ tool: downloadTool(), run: runDownloadTool });
   if (!library) return list;
   // With a library, every fetching tool takes the folder to keep its texts in.
   const withFolder = (tool) => ({ ...tool, inputSchema: { ...tool.inputSchema,
     properties: { ...tool.inputSchema.properties, folder: FOLDER_ARG } } });
   const own = library.perCaller ? library.member(caller) : library;
   if (!own) return [...list, ...libraryTools(noLibrary)];
-  return [...list.map(({ tool, run }) => ({ tool: withFolder(tool), run: keeping(run, own, tool.name) })), ...libraryTools(own)];
+  // A downloaded video has no text, so download_video keeps nothing and takes no folder.
+  const wrap = (entry) => (entry.tool.name === 'download_video' ? entry
+    : { tool: withFolder(entry.tool), run: keeping(entry.run, own, entry.tool.name) });
+  return [...list.map(wrap), ...libraryTools(own)];
 }
 
 // ---------------------------------------------------------------------------

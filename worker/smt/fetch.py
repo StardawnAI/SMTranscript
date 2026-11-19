@@ -204,6 +204,39 @@ def session(proxy: str | None, cookiefile: Path | None, max_mb: int, keep_media:
     return Session(proxy, cookiefile, max_mb, keep_media, count, want_video)
 
 
+# A download (job kind "download") is the whole video as one mp4 file: mp4
+# picture and m4a sound merged, else the best single mp4, else whatever is best.
+DOWNLOAD_FORMAT = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+
+
+class FileSession(Session):
+    """Resolve and download the whole video for a download link: no captions,
+    no transcription. YouTube's video extractor is allowed here only."""
+
+    def __init__(self, proxy: str | None, cookiefile: Path | None, max_mb: int, count):
+        opts = _opts(proxy, cookiefile, Path("."), max_mb)
+        opts.update(allowed_extractors=[*EXTRACTORS, "youtube"], format=DOWNLOAD_FORMAT,
+                    writesubtitles=False, writeautomaticsub=False)
+        self._ydl = _ydl_class()(opts, count)
+
+    def download(self, info: dict, tmp: Path, captions_only: bool = False) -> dict:
+        self._ydl.params["outtmpl"]["default"] = str(tmp / "media.%(ext)s")
+        try:
+            self._ydl.process_ie_result(copy.deepcopy(info), download=True)
+        except Exception as exc:  # noqa: BLE001
+            raise classify(exc) from exc
+        video = next((f for f in sorted(tmp.iterdir()) if f.name.startswith("media.") and f.suffix in VIDEO_EXT
+                      and f.name.count(".") == 1), None)
+        if video is None:
+            raise JobError("too_large", f"no video file arrived (over {self._ydl.params['max_filesize'] // 2**20} MB, "
+                                        "or nothing to download)")
+        return {"video": video, "captions": []}
+
+
+def file_session(proxy: str | None, cookiefile: Path | None, max_mb: int, count) -> FileSession:
+    return FileSession(proxy, cookiefile, max_mb, count)
+
+
 def caption_segments(track: dict) -> list[dict]:
     return captions.parse(Path(track["path"]).read_text(encoding="utf-8", errors="replace"), track["ext"])
 

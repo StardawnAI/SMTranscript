@@ -1,4 +1,6 @@
-// The customer text library. Secret: ADMIN_TOKEN_SHA256, the SHA-256 (hex) of the operator's admin token.
+// The customer text library and the one-hour video downloads.
+// Secrets: ADMIN_TOKEN_SHA256, the SHA-256 (hex) of the operator's admin token;
+// UPLOAD_TOKEN_SHA256, the SHA-256 (hex) of the token the SMTranscript worker uploads downloads with.
 {
   "name": "smtranscript-library",
   "main": "worker.mjs",
@@ -8,9 +10,16 @@
   "durable_objects": {
     "bindings": [
       { "name": "LIBRARY", "class_name": "Library" },
-      { "name": "DIRECTORY", "class_name": "Directory" }
+      { "name": "DIRECTORY", "class_name": "Directory" },
+      { "name": "DOWNLOAD_INDEX", "class_name": "Downloads" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Library", "Directory"] }],
+  // Files under downloads/ leave after one hour (the Downloads alarm); the bucket's
+  // lifecycle rule on downloads/ (1 day) is the backstop.
+  "r2_buckets": [{ "binding": "DOWNLOADS", "bucket_name": "awg-smtranscript" }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Library", "Directory"] },
+    { "tag": "v2", "new_sqlite_classes": ["Downloads"] }
+  ],
   "observability": { "enabled": false }
 }

@@ -2,7 +2,7 @@
 name: awg-sm-transcript
 description: Get TikTok, Instagram and Vimeo transcripts — one video or reel, or the newest videos of a TikTok or Instagram account — and the pictures of Instagram posts. Use when the user pastes a TikTok, Instagram or Vimeo link (tiktok.com, vm.tiktok.com, instagram.com/reel, /p/, an account, vimeo.com), asks what such a video says or what is on a post's pictures, wants reels or TikToks summarised, compared or mined, or types /awg-sm-transcript. If it fails it repairs itself with /awg-sm-transcript-setup and tries again.
 argument-hint: <TikTok, Instagram or Vimeo link | account link>
-allowed-tools: mcp__plugin_awg-smtranscript_smtranscript__get_social_transcript, mcp__plugin_awg-smtranscript_smtranscript__get_instagram_images
+allowed-tools: mcp__plugin_awg-smtranscript_smtranscript__get_social_transcript, mcp__plugin_awg-smtranscript_smtranscript__get_instagram_images, mcp__plugin_awg-smtranscript_smtranscript__download_video
 ---
 
 # TikTok, Instagram and Vimeo transcripts
@@ -25,6 +25,9 @@ The work happens in a Docker container the tool starts by itself.
 - An Instagram picture post or carousel, or a question about what is on its pictures →
   `get_instagram_images`: each picture's link, the text on it, the caption, and the pictures
   themselves. `get_social_transcript` hands a picture post over to it by itself.
+- The user wants the video itself as a file (download it, give me the mp4) → `download_video`
+  with the link (YouTube, TikTok, Instagram or Vimeo). It answers with a public link that works for
+  one hour; hand that link to the user to click and say that the file is deleted after the hour.
 - A YouTube link is not for this tool: use `/awg-yt-transcript`.
 
 Use `language` only if the user asked for captions in a language. Use `route: "warp"` only if
